@@ -9,37 +9,58 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 /* --------------------------------------------------------------------------
- * CORS (supports multiple origins via CORS_ORIGIN env)
- * Example .env:
- *   CORS_ORIGIN=http://localhost:5173,http://localhost:4173,https://your.site
+ * CORS (multi-origin + wildcard support)
+ * Set CORS_ORIGIN env to a comma-separated list, e.g.:
+ *   CORS_ORIGIN=https://wacksnflfrenzy.netlify.app,*.netlify.app,http://localhost:5173,http://localhost:4173
  * -------------------------------------------------------------------------- */
-const allowedOrigins = (process.env.CORS_ORIGIN ||
+const rawAllowed = (process.env.CORS_ORIGIN ||
   "http://localhost:5173,http://localhost:4173")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Helpful in some proxies/CDNs to ensure correct caching behavior
+// Help caches/CDNs vary by Origin
 app.use((req, res, next) => {
   res.header("Vary", "Origin");
   next();
 });
 
+// Accept exact matches and *.netlify.app if present
+function isOriginAllowed(origin) {
+  // Non-browser tools (curl/health checks) may not send Origin
+  if (!origin) return true;
+
+  // Exact match
+  if (rawAllowed.includes(origin)) return true;
+
+  // Wildcard for Netlify previews
+  try {
+    const host = new URL(origin).hostname; // e.g. wacksnflfrenzy.netlify.app
+    if (rawAllowed.includes("*.netlify.app") && host.endsWith(".netlify.app")) {
+      return true;
+    }
+  } catch {
+    // ignore malformed Origin
+  }
+
+  return false;
+}
+
 const corsOptions = {
   origin(origin, cb) {
-    // Allow requests without Origin (curl/Postman) and any whitelisted origin
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error("CORS: origin not allowed"));
+    if (isOriginAllowed(origin)) return cb(null, true);
+    console.warn("CORS blocked origin:", origin, "allowed=", rawAllowed);
+    cb(new Error("CORS: origin not allowed"));
   },
   credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  optionsSuccessStatus: 204, // for legacy browsers
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
-// (Optional) If you want to be extra explicit for preflight:
-// app.options("*", cors(corsOptions));
+// Ensure preflight is handled explicitly as well
+app.options("*", cors(corsOptions));
 
 /* --------------------------------------------------------------------------
  * Core middleware
@@ -60,14 +81,14 @@ const adminUsersRoutes = require("./routes/adminUsers");
 const passwordResetRoutes = require("./routes/passwordReset");
 const adminEmailRoutes = require("./routes/adminEmail");
 
-// Expose auth under BOTH /auth and /users for compatibility with older frontend code
+// Auth under BOTH /auth and /users for older frontends
 app.use("/auth", authRoutes);
 app.use("/users", authRoutes);
 
-// Extra user endpoints live here (ensure these do NOT redefine /login or /signup)
+// Extra user endpoints (must NOT redefine /login or /signup)
 app.use("/users", userRoutes);
 
-// App feature routes
+// Feature routes
 app.use("/picks", pickRoutes);
 app.use("/games", gameRoutes);
 app.use("/admin", adminRoutes);
@@ -84,7 +105,7 @@ app.get("/healthz", (req, res) => {
     ok: true,
     env: process.env.NODE_ENV || "development",
     time: new Date().toISOString(),
-    cors_allowed: allowedOrigins,
+    cors_allowed: rawAllowed,
   });
 });
 
