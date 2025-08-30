@@ -1,14 +1,14 @@
 // backend/routes/auth.js
 const express = require('express');
 const router = express.Router();
-const bcrypt = require('bcryptjs'); // keep bcryptjs to match your stack
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../db');
 const emailSvc = require('../services/email');
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const TOKEN_TTL = '12h';
+const TOKEN_TTL = process.env.TOKEN_TTL || '12h';
 const RESET_TOKEN_BYTES = 32;          // 64 hex chars
 const RESET_EXPIRES_HOURS = 2;         // reset link validity
 
@@ -19,6 +19,9 @@ function normalizeEmail(raw = '') {
 }
 
 function signToken(userId) {
+  if (!JWT_SECRET || !JWT_SECRET.trim()) {
+    throw new Error('Server misconfigured: JWT_SECRET missing');
+  }
   return jwt.sign({ user_id: userId }, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
 
@@ -76,6 +79,17 @@ function shapeUser(u = {}) {
   };
 }
 
+/** Return whichever hash column exists/populated (password_hash preferred). */
+function getStoredHash(userRow) {
+  if (userRow && userRow.password_hash && String(userRow.password_hash).length > 0) {
+    return userRow.password_hash;
+  }
+  if (userRow && userRow.password && String(userRow.password).length > 0) {
+    return userRow.password;
+  }
+  return null;
+}
+
 function requireJwt(req, res, next) {
   try {
     const header = req.headers.authorization || '';
@@ -123,20 +137,29 @@ async function handleSignup(req, res) {
       (last_name?.trim() ? ` ${last_name.trim()}` : '') ||
       (name?.trim() || null);
 
-    // Prefer modern schema (approved, deactivated). Fallback to legacy.
+    // Try to insert with both password_hash and password (preferred modern schema).
     try {
       await pool.query(
-        `INSERT INTO users (email, password, first_name, last_name, name, is_admin, approved, deactivated)
-         VALUES ($1,$2,$3,$4,$5,false,false,false)`,
+        `INSERT INTO users (email, password, password_hash, first_name, last_name, name, is_admin, approved, deactivated)
+         VALUES ($1,$2,$2,$3,$4,$5,false,false,false)`,
         [email, hashed, first_name || null, last_name || null, displayName]
       );
     } catch (e) {
-      // Legacy schema fallback (no approved/deactivated)
-      await pool.query(
-        `INSERT INTO users (email, password, first_name, last_name, name, is_admin)
-         VALUES ($1,$2,$3,$4,$5,false)`,
-        [email, hashed, first_name || null, last_name || null, displayName]
-      );
+      // Fallback legacy shape(s)
+      try {
+        await pool.query(
+          `INSERT INTO users (email, password, password_hash, first_name, last_name, name, is_admin, pending_approval, is_active)
+           VALUES ($1,$2,$2,$3,$4,$5,false,true,true)`,
+          [email, hashed, first_name || null, last_name || null, displayName]
+        );
+      } catch (e2) {
+        // Last resort: only password column exists
+        await pool.query(
+          `INSERT INTO users (email, password, first_name, last_name, name, is_admin)
+           VALUES ($1,$2,$3,$4,$5,false)`,
+          [email, hashed, first_name || null, last_name || null, displayName]
+        );
+      }
     }
 
     // New accounts are pending; no token yet.
@@ -163,7 +186,7 @@ router.post('/register', handleSignup);
  *  - Else if user is pending approval and not admin => 403 { code: "PENDING_APPROVAL" }
  *  - Else: return token + user
  *
- * NOTE: We check INACTIVE **first** so deactivated accounts don't appear as "pending".
+ * Tolerates either users.password_hash or users.password (both bcrypt).
  */
 router.post('/login', async (req, res) => {
   try {
@@ -181,10 +204,15 @@ router.post('/login', async (req, res) => {
     const rawUser = q.rows[0];
     if (!rawUser) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const ok = await bcrypt.compare(password, rawUser.password || '');
+    const stored = getStoredHash(rawUser);
+    if (!stored) {
+      console.error('Login error: no stored hash for user', rawUser.email);
+      return res.status(500).json({ error: 'Server error during login' });
+    }
+
+    const ok = await bcrypt.compare(password, stored);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
 
-    // Normalize/derive flags for consistent gating logic
     const u = shapeUser(rawUser);
 
     // Check INACTIVE first
@@ -310,9 +338,13 @@ router.post('/perform-reset', async (req, res) => {
     const row = rq.rows[0];
     if (!row) return res.status(400).json({ error: 'Reset link is invalid or expired' });
 
-    // Update password
+    // Update password -> write BOTH columns for compatibility
     const hashed = await bcrypt.hash(newPassword, 10);
-    await pool.query(`UPDATE users SET password=$1 WHERE id=$2`, [hashed, row.user_id]);
+    try {
+      await pool.query(`UPDATE users SET password=$1, password_hash=$1 WHERE id=$2`, [hashed, row.user_id]);
+    } catch {
+      await pool.query(`UPDATE users SET password=$1 WHERE id=$2`, [hashed, row.user_id]);
+    }
 
     // Mark this token as used
     await pool.query(`UPDATE password_resets SET used = true WHERE id = $1`, [row.id]);
