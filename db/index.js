@@ -5,19 +5,26 @@ const connectionString = process.env.DATABASE_URL || '';
 const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
 
 /**
- * Decide if SSL is needed:
- * - Railway & other managed hosts often require SSL and supply "?sslmode=require"
- * - We also enable SSL in production by default, but allow self-signed certs
+ * Railway / managed DBs need SSL, but the cert is self-signed.
+ * Force SSL and disable cert verification only when we detect a managed host
+ * or sslmode=require, or in production as a fallback.
  */
 const needSSL =
   /sslmode=require/i.test(connectionString) ||
   /\b(railway\.app|proxy\.rlwy\.net|amazonaws\.com|neon\.tech|supabase\.co)\b/i.test(connectionString) ||
-  process.env.PGSSLMODE === 'require' ||
   isProd;
+
+// As an additional guardrail for managed DBs, disable Node TLS verification
+// ONLY when we decided SSL is needed (i.e., managed environments).
+if (needSSL) {
+  // NOTE: This affects only this process.
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
 
 const pool = new Pool({
   connectionString,
-  ssl: needSSL ? { rejectUnauthorized: false } : false,
+  // Explicitly request SSL and tell pg not to verify the chain
+  ssl: needSSL ? { require: true, rejectUnauthorized: false } : false,
 });
 
 // Helpful logs
@@ -25,7 +32,7 @@ pool.on('error', (err) => {
   console.error('[DB] Pool error:', err);
 });
 
-// Ping DB on startup so we can see success/failure in logs
+// Ping DB on startup so logs show whether we are connected
 (async () => {
   try {
     const r = await pool.query('select now() as now');
