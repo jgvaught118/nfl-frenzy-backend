@@ -86,6 +86,7 @@ const leaderboardRoutes = require("./routes/leaderboard");
 const adminUsersRoutes = require("./routes/adminUsers");
 const passwordResetRoutes = require("./routes/passwordReset");
 const adminEmailRoutes = require("./routes/adminEmail");
+const highlightsRoutes = require('./routes/highlights');
 
 app.use("/auth", authRoutes);
 app.use("/users", authRoutes);
@@ -97,6 +98,7 @@ app.use("/leaderboard", leaderboardRoutes);
 app.use("/admin/users", adminUsersRoutes);
 app.use("/auth", passwordResetRoutes);
 app.use("/admin/email", adminEmailRoutes);
+app.use('/games', highlightsRoutes);
 
 /* --------------------------------------------------------------------------
  * Health / Debug
