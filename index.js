@@ -13,25 +13,26 @@ const PORT = process.env.PORT || 5001;
  * - CORS_ORIGIN can be:
  *     "*"                           => allow all origins
  *     "https://site,*.netlify.app"  => CSV list, supports wildcard prefixes
- * - If CORS_ORIGIN is unset, we default to a safe allow-list for localhost.
+ * - If CORS_ORIGIN is unset, we default to localhost.
  * -------------------------------------------------------------------------- */
 const defaultAllow = ["http://localhost:5173", "http://localhost:4173"];
-const raw = (process.env.CORS_ORIGIN || defaultAllow.join(","))
+const rawAllowed = (process.env.CORS_ORIGIN || defaultAllow.join(","))
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const allowAll = raw.includes("*");
+const allowAll = rawAllowed.includes("*");
 
-// Make caches vary by origin
+// Ensure caches vary by origin
 app.use((_, res, next) => {
   res.header("Vary", "Origin");
   next();
 });
 
 function matchPattern(origin, pattern) {
-  // exact
-  if (pattern === origin) return true;
+  if (!origin || !pattern) return false;
+  if (pattern === origin) return true; // exact
+
   // wildcard like *.netlify.app
   if (pattern.startsWith("*.")) {
     try {
@@ -46,21 +47,21 @@ function matchPattern(origin, pattern) {
 }
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;          // curl/Postman/no-Origin
-  if (allowAll) return true;         // emergency wide-open
-  if (raw.some((p) => matchPattern(origin, p) || p === origin)) return true;
+  if (!origin) return true;             // curl/Postman/no-Origin
+  if (allowAll) return true;            // wide-open (temporary)
+  if (rawAllowed.some((p) => p === origin || matchPattern(origin, p))) return true;
   return false;
 }
 
 const corsOptions = {
   origin(origin, cb) {
     if (isAllowedOrigin(origin)) return cb(null, true);
-    console.warn("CORS blocked origin:", origin, "allowed:", raw);
+    console.warn("CORS blocked:", origin, "allowed:", rawAllowed);
     cb(new Error("CORS: origin not allowed"));
   },
-  credentials: false,                // not using cookies; bearer tokens instead
+  credentials: false, // using Bearer tokens, not cookies
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Let the cors package echo requested headers instead of hard-coding a list
+  // Let cors echo requested headers
   allowedHeaders: undefined,
   optionsSuccessStatus: 204,
 };
@@ -81,24 +82,37 @@ const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
 const pickRoutes = require("./routes/picks");
 const gameRoutes = require("./routes/games");
+const highlightsRoutes = require("./routes/highlights");
+
 const adminRoutes = require("./routes/admin");
-const leaderboardRoutes = require("./routes/leaderboard");
 const adminUsersRoutes = require("./routes/adminUsers");
+const adminEditRoutes = require("./routes/adminEdit");
+
+const leaderboardRoutes = require("./routes/leaderboard");
 const passwordResetRoutes = require("./routes/passwordReset");
 const adminEmailRoutes = require("./routes/adminEmail");
-const highlightsRoutes = require('./routes/highlights');
 
+// Auth (mounted both /auth and /users for legacy compatibility)
 app.use("/auth", authRoutes);
 app.use("/users", authRoutes);
+
+// Extra user endpoints (NOT login/signup)
 app.use("/users", userRoutes);
+
+// Feature routes
 app.use("/picks", pickRoutes);
 app.use("/games", gameRoutes);
+app.use("/games", highlightsRoutes);
+
+// Admin routes
 app.use("/admin", adminRoutes);
-app.use("/leaderboard", leaderboardRoutes);
+app.use("/admin", adminEditRoutes);      // PUT /admin/users/:id + /admin/quick-edit/users/:id
 app.use("/admin/users", adminUsersRoutes);
-app.use("/auth", passwordResetRoutes);
 app.use("/admin/email", adminEmailRoutes);
-app.use('/games', highlightsRoutes);
+
+// Leaderboard & password reset
+app.use("/leaderboard", leaderboardRoutes);
+app.use("/auth", passwordResetRoutes);
 
 /* --------------------------------------------------------------------------
  * Health / Debug
@@ -108,7 +122,7 @@ app.get("/healthz", (req, res) => {
     ok: true,
     env: process.env.NODE_ENV || "development",
     time: new Date().toISOString(),
-    cors_allowed: raw,
+    cors_allowed: rawAllowed,
     cors_allowAll: allowAll,
   });
 });
@@ -121,10 +135,12 @@ app.get("/whoami", (req, res) => {
       users_extra: true,
       picks: true,
       games: true,
+      highlights: true,
       admin: true,
-      leaderboard: true,
+      admin_edit: true,
       admin_users: true,
       admin_email: true,
+      leaderboard: true,
     },
     time: new Date().toISOString(),
   });
