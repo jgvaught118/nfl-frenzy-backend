@@ -91,6 +91,8 @@ const adminEditRoutes = require("./routes/adminEdit");
 const leaderboardRoutes = require("./routes/leaderboard");
 const passwordResetRoutes = require("./routes/passwordReset");
 const adminEmailRoutes = require("./routes/adminEmail");
+const scoresRoutes = require("./routes/scores");
+const adminScoresRoutes = require("./routes/adminScores");
 
 // Auth (mounted both /auth and /users for legacy compatibility)
 app.use("/auth", authRoutes);
@@ -109,6 +111,9 @@ app.use("/admin", adminRoutes);
 app.use("/admin", adminEditRoutes);      // PUT /admin/users/:id + /admin/quick-edit/users/:id
 app.use("/admin/users", adminUsersRoutes);
 app.use("/admin/email", adminEmailRoutes);
+app.use("/admin/scores", scoresRoutes);
+app.use("/admin/scores", adminScoresRoutes);
+
 
 // Leaderboard & password reset
 app.use("/leaderboard", leaderboardRoutes);
