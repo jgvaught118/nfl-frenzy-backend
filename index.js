@@ -112,8 +112,6 @@ app.use("/admin", adminEditRoutes);      // PUT /admin/users/:id + /admin/quick-
 app.use("/admin/users", adminUsersRoutes);
 app.use("/admin/email", adminEmailRoutes);
 app.use("/admin/scores", scoresRoutes);
-app.use("/admin/scores", adminScoresRoutes);
-
 
 // Leaderboard & password reset
 app.use("/leaderboard", leaderboardRoutes);
