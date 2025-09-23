@@ -1,48 +1,59 @@
 name: Score Auto-Sync
 
 on:
-  # Manual button in the Actions tab
+  schedule:
+    # Mon 04:30 UTC (post-SNF), Tue 05:30 UTC (post-MNF), Tue 13:00 UTC backstop
+    - cron: "30 4 * * 1"
+    - cron: "30 5 * * 2"
+    - cron: "0 13 * * 2"
   workflow_dispatch:
     inputs:
       week:
-        description: "Run a single week (leave empty for all)"
+        description: "Specific week to process (leave blank for all started weeks)"
         required: false
-  # Scheduled runs (UTC times)
-  schedule:
-    # Sunday Night (after SNF) ~ 11:30pm ET ≈ 04:30 UTC Monday
-    - cron: '30 4 * * 1'
-    # After Monday Night Football ~ 12:30–1:30am PT ≈ 05:30 UTC Tuesday
-    - cron: '30 5 * * 2'
-    # Tuesday morning backstop ~ 9:00am ET ≈ 13:00 UTC Tuesday
-    - cron: '0 13 * * 2'
+        type: string
 
 jobs:
-  run-score-sync:
+  sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       RW_DB: ${{ secrets.RW_DB }}
       RAILWAY_URL: ${{ secrets.RAILWAY_URL }}
       ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
-      NODE_TLS_REJECT_UNAUTHORIZED: 0
+      # ESPN uses HTTPS; your Railway cert setup has been fussy, so keep this off:
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
 
     steps:
-      - name: Check out repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 22
+          cache: npm
 
       - name: Install deps
-        run: npm ci || npm i --no-audit --no-fund
-
-      - name: Run sync (all or single week)
         run: |
-          if [ -n "${{ inputs.week }}" ]; then
-            echo "Running single week ${{ inputs.week }}"
-            node scripts/fetchScores.js --week ${{ inputs.week }} --fix
+          if [ -f package-lock.json ]; then
+            npm ci
           else
-            echo "Running all started weeks"
-            node scripts/fetchScores.js --all --fix
+            npm install
+          fi
+
+      - name: Verify secrets are present
+        run: |
+          [ -n "$RW_DB" ] || { echo "❌ RW_DB is missing"; exit 1; }
+          [ -n "$RAILWAY_URL" ] || { echo "❌ RAILWAY_URL is missing"; exit 1; }
+          [ -n "$ADMIN_KEY" ] || { echo "❌ ADMIN_KEY is missing"; exit 1; }
+          echo "✅ Secrets present"
+
+      - name: Run score sync
+        run: |
+          if [ -n "${{ github.event.inputs.week }}" ]; then
+            WEEK=${{ github.event.inputs.week }} npm run scores:week
+          else
+            npm run scores:now
           fi
