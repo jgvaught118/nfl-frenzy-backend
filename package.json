@@ -6,7 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "dev": "node index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "scores:audit": "node scripts/fetchScores.js --all",
+    "scores:now": "node scripts/fetchScores.js --all --fix",
+    "scores:week": "node scripts/fetchScores.js --week $WEEK --fix"
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.5",
