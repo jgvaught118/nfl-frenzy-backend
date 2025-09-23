@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "node index.js",
     "start": "node index.js",
-    "scores:audit": "node scripts/fetchScores.js --all",
     "scores:now": "node scripts/fetchScores.js --all --fix",
+    "scores:audit": "node scripts/fetchScores.js --all",
     "scores:week": "node scripts/fetchScores.js --week $WEEK --fix"
   },
   "dependencies": {
