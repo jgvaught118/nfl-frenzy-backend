@@ -18,6 +18,13 @@ jobs:
           node-version: "20.x"
           cache: "npm"
 
+      - name: Show repo tree (top level)
+        run: ls -la
+
+      - name: Show npm scripts at runner path
+        run: node -p "require('./package.json').scripts"
+    
+
       - name: Install deps
         run: npm ci
 
