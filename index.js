@@ -10,21 +10,16 @@ const PORT = process.env.PORT || 5001;
 
 /* --------------------------------------------------------------------------
  * CORS — robust & flexible
- * - CORS_ORIGIN can be:
- *     "*"                           => allow all origins
- *     "https://site,*.netlify.app"  => CSV list, supports wildcard prefixes
- * - If CORS_ORIGIN is unset, we default to localhost.
  * -------------------------------------------------------------------------- */
 const defaultAllow = ["http://localhost:5173", "http://localhost:4173"];
 const rawAllowed = (process.env.CORS_ORIGIN || defaultAllow.join(","))
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 const allowAll = rawAllowed.includes("*");
 
-// Ensure caches vary by origin
-app.use((_, res, next) => {
+app.set("trust proxy", true);               // Railway/Netlify front proxies
+app.use((_, res, next) => {                 // help caches vary by Origin
   res.header("Vary", "Origin");
   next();
 });
@@ -32,8 +27,6 @@ app.use((_, res, next) => {
 function matchPattern(origin, pattern) {
   if (!origin || !pattern) return false;
   if (pattern === origin) return true; // exact
-
-  // wildcard like *.netlify.app
   if (pattern.startsWith("*.")) {
     try {
       const host = new URL(origin).hostname;
@@ -45,27 +38,23 @@ function matchPattern(origin, pattern) {
   }
   return false;
 }
-
 function isAllowedOrigin(origin) {
-  if (!origin) return true;             // curl/Postman/no-Origin
-  if (allowAll) return true;            // wide-open (temporary)
+  if (!origin) return true;                // curl/Postman/no Origin
+  if (allowAll) return true;
   if (rawAllowed.some((p) => p === origin || matchPattern(origin, p))) return true;
   return false;
 }
-
 const corsOptions = {
   origin(origin, cb) {
     if (isAllowedOrigin(origin)) return cb(null, true);
     console.warn("CORS blocked:", origin, "allowed:", rawAllowed);
     cb(new Error("CORS: origin not allowed"));
   },
-  credentials: false, // using Bearer tokens, not cookies
+  credentials: false,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Let cors echo requested headers
   allowedHeaders: undefined,
   optionsSuccessStatus: 204,
 };
-
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
@@ -94,6 +83,20 @@ const adminEmailRoutes = require("./routes/adminEmail");
 const scoresRoutes = require("./routes/scores");
 const adminScoresRoutes = require("./routes/adminScores");
 
+// Public games router (unauthenticated read-only)
+const publicGamesRouter = require("./routes/publicGames");
+
+// Health first (cheap)
+app.get("/healthz", (req, res) => {
+  res.json({
+    ok: true,
+    env: process.env.NODE_ENV || "development",
+    time: new Date().toISOString(),
+    cors_allowed: rawAllowed,
+    cors_allowAll: allowAll,
+  });
+});
+
 // Auth (mounted both /auth and /users for legacy compatibility)
 app.use("/auth", authRoutes);
 app.use("/users", authRoutes);
@@ -106,9 +109,12 @@ app.use("/picks", pickRoutes);
 app.use("/games", gameRoutes);
 app.use("/games", highlightsRoutes);
 
+// Public read-only API for frontend display (odds/scores)
+app.use("/public", publicGamesRouter);
+
 // Admin routes
 app.use("/admin", adminRoutes);
-app.use("/admin", adminEditRoutes);      // PUT /admin/users/:id + /admin/quick-edit/users/:id
+app.use("/admin", adminEditRoutes);      // PUT /admin/users/:id + quick-edit
 app.use("/admin/users", adminUsersRoutes);
 app.use("/admin/email", adminEmailRoutes);
 app.use("/admin/scores", scoresRoutes);
@@ -117,40 +123,21 @@ app.use("/admin/scores", scoresRoutes);
 app.use("/leaderboard", leaderboardRoutes);
 app.use("/auth", passwordResetRoutes);
 
-/* --------------------------------------------------------------------------
- * Health / Debug
- * -------------------------------------------------------------------------- */
-app.get("/healthz", (req, res) => {
-  res.json({
-    ok: true,
-    env: process.env.NODE_ENV || "development",
-    time: new Date().toISOString(),
-    cors_allowed: rawAllowed,
-    cors_allowAll: allowAll,
-  });
-});
-
-app.get("/whoami", (req, res) => {
-  res.json({
-    mounted: {
-      auth: true,
-      users_auth_alias: true,
-      users_extra: true,
-      picks: true,
-      games: true,
-      highlights: true,
-      admin: true,
-      admin_edit: true,
-      admin_users: true,
-      admin_email: true,
-      leaderboard: true,
-    },
-    time: new Date().toISOString(),
-  });
-});
-
+// Root
 app.get("/", (_, res) => {
   res.send("NFL Frenzy Backend is running.");
+});
+
+/* --------------------------------------------------------------------------
+ * Fallbacks & error handling
+ * -------------------------------------------------------------------------- */
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found", path: req.originalUrl });
+});
+
+app.use((err, req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Server error" });
 });
 
 app.listen(PORT, () => {
