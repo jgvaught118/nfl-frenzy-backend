@@ -28,11 +28,13 @@ jobs:
         run: |
           [ -n "$RW_DB" ] || { echo "❌ RW_DB is missing"; exit 1; }
           [ -n "$ODDS_API_KEY" ] || { echo "❌ ODDS_API_KEY is missing"; exit 1; }
-
+    
       - name: Update Caesars odds (current + future weeks only)
         env:
           RW_DB: ${{ secrets.RW_DB }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           NODE_TLS_REJECT_UNAUTHORIZED: "0"   # for Railway TLS chain
+          MIN_WEEK: "8"                       # 👈 new line
         run: |
           npm run odds:now
+
