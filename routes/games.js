@@ -1,112 +1,96 @@
-// nfl-frezy-backend/routes/games.js
-const express = require('express');
+// routes/games.js
+/* eslint-disable no-console */
+const express = require("express");
 const router = express.Router();
-const db = require('../db');
-const fetch = require('node-fetch');
-
-// Helper: Get week number from a date (adjust season opener if needed)
-function getNFLWeekFromDate(gameDate) {
-  const seasonStart = new Date('2025-09-04T00:00:00Z'); // Adjust to 2025 season opener
-  const diff = new Date(gameDate) - seasonStart;
-  const week = Math.floor(diff / (7 * 24 * 60 * 60 * 1000)) + 1;
-  return week > 0 ? week : 1;
-}
+const db = require("../db");
 
 /**
- * 1) /games/week/:week
- * Fetch games for a specific week as the Picks Form expects
+ * GET /games/week/:week
+ * Returns all games for a specific week.
+ * Uses live line_* fields written by the odds sync job.
+ * Response keeps the legacy keys "favorite" and "spread" so the frontend works unchanged.
  */
-router.get('/week/:week', async (req, res) => {
-  const { week } = req.params;
-
+router.get("/week/:week", async (req, res, next) => {
   try {
-    const result = await db.query(
-      `SELECT
-         id,
-         week,
-         home_team,
-         away_team,
-         start_time AS kickoff,
-         favorite,
-         spread,
-         home_score,
-         away_score
-       FROM games
-       WHERE week = $1
-       ORDER BY start_time`,
+    const week = Number(req.params.week);
+    if (!Number.isFinite(week)) {
+      return res.status(400).json({ error: "Invalid week" });
+    }
+
+    const { rows } = await db.query(
+      `
+      SELECT
+        id,
+        week,
+        home_team,
+        away_team,
+        kickoff,           -- correct column in your DB
+        home_score,
+        away_score,
+        line_favorite,
+        line_spread,
+        line_over_under,
+        line_source,
+        line_updated_at
+      FROM games
+      WHERE week = $1
+      ORDER BY kickoff, id;
+      `,
       [week]
     );
 
-    if (result.rows.length === 0) {
+    if (!rows.length) {
       return res.status(404).json({ error: "No games found for this week" });
     }
 
-    return res.json(result.rows);
+    // Map DB -> API shape that the frontend already uses
+    const payload = rows.map((r) => ({
+      id: r.id,
+      week: r.week,
+      home_team: r.home_team,
+      away_team: r.away_team,
+      kickoff: r.kickoff,
+      home_score: r.home_score,
+      away_score: r.away_score,
+
+      // legacy keys used by UI
+      favorite: r.line_favorite ?? null,
+      spread: r.line_spread != null ? String(r.line_spread) : null,
+
+      // extra info (available if/when you want to show it)
+      over_under: r.line_over_under != null ? String(r.line_over_under) : null,
+      line_source: r.line_source || null,
+      line_updated_at: r.line_updated_at || null,
+    }));
+
+    res.json(payload);
   } catch (err) {
-    console.error('Error fetching games for week:', err);
-    return res.status(500).json({ error: 'Error fetching games for this week' });
+    next(err);
   }
 });
 
 /**
- * 2) /games/update
- * Pulls schedule & odds from The Odds API
+ * (Deprecated) GET /games/update
+ * Previously pulled odds directly. We now populate odds via the CI job (scripts/fetchOdds.js).
+ * Return 410 Gone to avoid accidental usage.
  */
-router.get('/update', async (req, res) => {
-  const apiKey = process.env.ODDS_API_KEY;
-  const url = `https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey=${apiKey}&regions=us&markets=spreads&oddsFormat=american`;
-
-  try {
-    const response = await fetch(url);
-    const games = await response.json();
-
-    let insertedCount = 0;
-
-    for (const game of games) {
-      const { home_team, away_team, commence_time, bookmakers } = game;
-      const startTime = new Date(commence_time);
-      const week = getNFLWeekFromDate(startTime);
-
-      const draftKings = bookmakers?.find(b => b.key === 'draftkings') || bookmakers?.[0];
-      const spreadMarket = draftKings?.markets?.find(m => m.key === 'spreads');
-
-      let favorite = null;
-      let spread = null;
-
-      if (spreadMarket && spreadMarket.outcomes?.length === 2) {
-        const [team1, team2] = spreadMarket.outcomes;
-        if (team1.point < team2.point) {
-          favorite = team1.name;
-          spread = Math.abs(team1.point);
-        } else {
-          favorite = team2.name;
-          spread = Math.abs(team2.point);
-        }
-      }
-
-      await db.query(
-        `INSERT INTO games (week, home_team, away_team, start_time, favorite, spread)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (week, home_team, away_team) DO NOTHING`,
-        [week, home_team, away_team, startTime, favorite, spread]
-      );
-
-      insertedCount++;
-    }
-
-    console.log(`Inserted ${insertedCount} games.`);
-    return res.status(200).json({ message: `${insertedCount} games inserted.` });
-  } catch (error) {
-    console.error('Error updating games:', error);
-    return res.status(500).json({ error: 'Failed to update games' });
-  }
+router.get("/update", (_req, res) => {
+  res
+    .status(410)
+    .json({
+      error: "Deprecated",
+      message:
+        "Odds are synced by CI (scripts/fetchOdds.js). This endpoint is disabled.",
+    });
 });
 
 /**
- * 3) /games/update-scores
- * Pulls FINAL scores from TheSportsDB and updates DB
+ * GET /games/update-scores
+ * Keeps your existing score update pathway (TheSportsDB) for now.
+ * If you’ve replaced scores elsewhere, feel free to remove this route later.
  */
-router.get('/update-scores', async (req, res) => {
+router.get("/update-scores", async (req, res) => {
+  const fetch = (await import("node-fetch")).default;
   const apiKey = process.env.SPORTSDB_API_KEY || process.env.THESPORTSDB_API_KEY;
 
   if (!apiKey) {
@@ -130,33 +114,29 @@ router.get('/update-scores', async (req, res) => {
     for (const event of data.events) {
       const homeTeam = event.strHomeTeam;
       const awayTeam = event.strAwayTeam;
-      const homeScore = parseInt(event.intHomeScore);
-      const awayScore = parseInt(event.intAwayScore);
+      const homeScore = parseInt(event.intHomeScore, 10);
+      const awayScore = parseInt(event.intAwayScore, 10);
 
-      if (isNaN(homeScore) || isNaN(awayScore)) {
-        console.log(`Skipping game: ${homeTeam} vs ${awayTeam} - missing scores`);
+      if (Number.isNaN(homeScore) || Number.isNaN(awayScore)) {
         continue;
       }
 
       const result = await db.query(
-        `UPDATE games
-         SET home_score = $1, away_score = $2
-         WHERE home_team = $3 AND away_team = $4`,
+        `
+        UPDATE games
+           SET home_score = $1, away_score = $2
+         WHERE home_team = $3 AND away_team = $4
+        `,
         [homeScore, awayScore, homeTeam, awayTeam]
       );
 
-      if (result.rowCount > 0) {
-        updatedCount++;
-        console.log(`✅ Updated score: ${homeTeam} ${homeScore} - ${awayScore} ${awayTeam}`);
-      } else {
-        console.log(`⚠ No match in DB for: ${homeTeam} vs ${awayTeam}`);
-      }
+      if (result.rowCount > 0) updatedCount++;
     }
 
     return res.status(200).json({ message: `${updatedCount} games updated with final scores.` });
   } catch (error) {
-    console.error('Error updating scores:', error);
-    return res.status(500).json({ error: 'Failed to update scores' });
+    console.error("Error updating scores:", error);
+    return res.status(500).json({ error: "Failed to update scores" });
   }
 });
 
