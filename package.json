@@ -9,7 +9,9 @@
     "start": "node index.js",
     "scores:now": "node scripts/fetchScores.js --all --fix",
     "scores:audit": "node scripts/fetchScores.js --all",
-    "scores:week": "node scripts/fetchScores.js --week $WEEK --fix"
+    "scores:week": "node scripts/fetchScores.js --week $WEEK --fix",
+    "odds:now": "node scripts/fetchOdds.js --all",
+    "odds:week": "node scripts/fetchOdds.js --week $WEEK"
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.5",
