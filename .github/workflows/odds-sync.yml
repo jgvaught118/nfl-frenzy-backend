@@ -1,0 +1,38 @@
+name: Daily Caesars Odds Sync
+
+on:
+  schedule:
+    - cron: "5 12 * * *"   # daily at 12:05 UTC (adjust as desired)
+  workflow_dispatch: {}     # allow manual runs
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: "npm"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Sanity check secrets
+        env:
+          RW_DB: ${{ secrets.RW_DB }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          [ -n "$RW_DB" ] || { echo "❌ RW_DB is missing"; exit 1; }
+          [ -n "$ODDS_API_KEY" ] || { echo "❌ ODDS_API_KEY is missing"; exit 1; }
+
+      - name: Update Caesars odds (current + future weeks only)
+        env:
+          RW_DB: ${{ secrets.RW_DB }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          NODE_TLS_REJECT_UNAUTHORIZED: "0"   # for Railway TLS chain
+        run: |
+          npm run odds:now
