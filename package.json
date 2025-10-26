@@ -29,3 +29,9 @@
     "uuid": "^11.1.0"
   }
 }
+{
+  "scripts": {
+    "kickoffs:sync": "node scripts/syncKickoffsFromSportsdata.js",
+    "kickoffs:audit": "node scripts/syncKickoffsFromSportsdata.js"
+  }
+}
