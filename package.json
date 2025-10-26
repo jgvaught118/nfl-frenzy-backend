@@ -11,7 +11,9 @@
     "scores:audit": "node scripts/fetchScores.js --all",
     "scores:week": "node scripts/fetchScores.js --week $WEEK --fix",
     "odds:now": "node scripts/fetchOdds.js --all",
-    "odds:week": "node scripts/fetchOdds.js --week $WEEK"
+    "odds:week": "node scripts/fetchOdds.js --week $WEEK",
+    "kickoffs:sync": "node scripts/syncKickoffsFromSportsdata.js",
+    "kickoffs:audit": "node scripts/syncKickoffsFromSportsdata.js"
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.5",
@@ -27,11 +29,5 @@
     "nodemailer": "^7.0.5",
     "pg": "^8.16.3",
     "uuid": "^11.1.0"
-  }
-}
-{
-  "scripts": {
-    "kickoffs:sync": "node scripts/syncKickoffsFromSportsdata.js",
-    "kickoffs:audit": "node scripts/syncKickoffsFromSportsdata.js"
   }
 }
