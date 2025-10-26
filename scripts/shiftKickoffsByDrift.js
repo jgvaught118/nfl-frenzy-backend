@@ -6,9 +6,9 @@ const { Client } = require("pg");
 
 const { RW_DB, ODDS_API_KEY } = process.env;
 const MIN_WEEK = Number(process.env.MIN_WEEK || 8);
-const TARGET = Number(process.env.TARGET_MINUTES || 240); // e.g. +240 if DB is 4h early
+const TARGET = Number(process.env.TARGET_MINUTES || 240); // expected drift in minutes
 const TOL = Number(process.env.TOL || 20);                 // tolerance window in minutes
-const DRY = !process.env.APPLY;                            // APPLY=1 to actually write
+const DRY = !process.env.APPLY;                            // APPLY=1 to write
 
 if (!RW_DB) { console.error("❌ Missing env: RW_DB"); process.exit(2); }
 if (!ODDS_API_KEY) { console.error("❌ Missing env: ODDS_API_KEY"); process.exit(2); }
@@ -98,7 +98,8 @@ async function main() {
     const dbKick = new Date(g.kickoff);
     const deltaMin = Math.round((apiKick - dbKick) / 60000);
     if (Math.abs(deltaMin - TARGET) <= TOL) {
-      if (dbKick <= new Date(Date.now() - 5 * 60000)) continue; // don’t touch started games
+      // don't touch already-started games
+      if (dbKick <= new Date(Date.now() - 5 * 60000)) continue;
       toUpdate.push({
         id: g.id, week: g.week, match: `${g.home_team} vs ${g.away_team}`,
         dbKickISO: dbKick.toISOString(), apiKickISO: apiKick.toISOString(), deltaMin
