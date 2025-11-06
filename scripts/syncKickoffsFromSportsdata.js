@@ -1,333 +1,231 @@
-/* eslint-disable no-console */
-/**
- * Sync all game kickoff times from SportsDataIO official schedule.
- *
- * Uses:
- *  - SPORTSDATA_API_KEY
- *  - SPORTSDATA_SEASON  (e.g. "2025REG")
- *  - RW_DB (Railway Postgres URL) or DATABASE_URL
- *
- * Logic:
- *  - Fetch full NFL schedule for the season from SportsDataIO.
- *  - For each DB game (by week, home_team, away_team):
- *      - Find matching SportsData game via canonicalized names.
- *      - Use SportsData DateTimeUTC as the single source of truth.
- *      - If |dbKickoff - apiKickoff| >= 60s, update DB kickoff.
- *
- * This avoids “blind +4 hours” and handles DST correctly.
- */
+// scripts/syncKickoffsFromSportsdata.js
+// Align DB kickoff times with SportsDataIO schedule.
+// Usage:
+//   npm run kickoffs:audit   # dry run
+//   npm run kickoffs:sync    # apply updates
+//
+// Requires env:
+//   RW_DB or DATABASE_URL  -> postgres connection string
+//   SPORTSDATA_API_KEY
+//   SPORTSDATA_SEASON      -> e.g. "2025REG"
 
-const { Client } = require("pg");
+require("dotenv").config();
 const fetch = require("node-fetch");
+const { Client } = require("pg");
 
-const {
-  SPORTSDATA_API_KEY,
-  SPORTSDATA_SEASON,
-  RW_DB,
-  DATABASE_URL,
-} = process.env;
+const lifecycle = process.env.npm_lifecycle_event || "";
+const APPLY = lifecycle === "kickoffs:sync";
 
-if (!SPORTSDATA_API_KEY) {
-  console.error("Missing env: SPORTSDATA_API_KEY");
-  process.exit(2);
+const SEASON = process.env.SPORTSDATA_SEASON || "2025REG";
+const API_KEY = process.env.SPORTSDATA_API_KEY;
+const DB_URL = process.env.RW_DB || process.env.DATABASE_URL;
+
+if (!API_KEY) {
+  console.error("FATAL: SPORTSDATA_API_KEY not set.");
+  process.exit(1);
 }
-if (!SPORTSDATA_SEASON) {
-  console.error("Missing env: SPORTSDATA_SEASON (e.g. 2025REG)");
-  process.exit(2);
-}
-
-const DB_URL = RW_DB || DATABASE_URL;
 if (!DB_URL) {
-  console.error("Missing env: RW_DB or DATABASE_URL");
-  process.exit(2);
+  console.error("FATAL: RW_DB or DATABASE_URL not set.");
+  process.exit(1);
 }
 
-const APPLY = String(process.env.APPLY || "").toLowerCase() === "1";
-const MIN_WEEK = Number(process.env.MIN_WEEK || 1);
-const MAX_DELTA_SEC = 60; // if >= 60s difference, we correct
+const SCHEDULE_URL = `https://api.sportsdata.io/v3/nfl/scores/json/Schedules/${SEASON}?key=${API_KEY}`;
 
-// ---------- Helpers ----------
-
-const slug = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-
-function canonicalTeam(raw) {
-  const x = slug(raw);
-
-  // direct map for standard NFL teams
-  const map = {
-    // full names / nicknames normalized
-    arizonacardinals: "arizonacardinals",
-    cardinals: "arizonacardinals",
-
-    atlantafalcons: "atlantafalcons",
-    falcons: "atlantafalcons",
-
-    baltimoreravens: "baltimoreravens",
-    ravens: "baltimoreravens",
-
-    buffalobills: "buffalobills",
-    bills: "buffalobills",
-
-    carolinapanthers: "carolinapanthers",
-    panthers: "carolinapanthers",
-
-    chicagobears: "chicagobears",
-    bears: "chicagobears",
-
-    cincinnatibengals: "cincinnatibengals",
-    bengals: "cincinnatibengals",
-
-    clevelandbrowns: "clevelandbrowns",
-    browns: "clevelandbrowns",
-
-    dallascowboys: "dallascowboys",
-    cowboys: "dallascowboys",
-
-    denverbroncos: "denverbroncos",
-    broncos: "denverbroncos",
-
-    detroitlions: "detroitlions",
-    lions: "detroitlions",
-
-    greenbaypackers: "greenbaypackers",
-    packers: "greenbaypackers",
-    gbpackers: "greenbaypackers",
-
-    houstontexans: "houstontexans",
-    texans: "houstontexans",
-
-    indianapolisco lts: "indianapoliscolts",
-    indianapoliscolts: "indianapoliscolts",
-    colts: "indianapoliscolts",
-
-    jacksonvillejaguars: "jacksonvillejaguars",
-    jags: "jacksonvillejaguars",
-    jaguars: "jacksonvillejaguars",
-
-    kansascitychiefs: "kansascitychiefs",
-    chiefs: "kansascitychiefs",
-    kcchiefs: "kansascitychiefs",
-
-    lasvegasraiders: "lasvegasraiders",
-    raiders: "lasvegasraiders",
-
-    losangeleschargers: "losangeleschargers",
-    chargers: "losangeleschargers",
-    lachargers: "losangeleschargers",
-
-    losangelesrams: "losangelesrams",
-    rams: "losangelesrams",
-    larams: "losangelesrams",
-
-    miamidolphins: "miamidolphins",
-    dolphins: "miamidolphins",
-
-    minnesotavikings: "minnesotavikings",
-    vikings: "minnesotavikings",
-
-    newenglandpatriots: "newenglandpatriots",
-    patriots: "newenglandpatriots",
-    nepatriots: "newenglandpatriots",
-
-    neworleanssaints: "neworleanssaints",
-    saints: "neworleanssaints",
-
-    newyorkgiants: "newyorkgiants",
-    giants: "newyorkgiants",
-    nygiants: "newyorkgiants",
-
-    newyorkjets: "newyorkjets",
-    jets: "newyorkjets",
-    nyjets: "newyorkjets",
-
-    philadelphiaeagles: "philadelphiaeagles",
-    eagles: "philadelphiaeagles",
-
-    pittsburghsteelers: "pittsburghsteelers",
-    steelers: "pittsburghsteelers",
-
-    sanfrancisco49ers: "sanfrancisco49ers",
-    "49ers": "sanfrancisco49ers",
-    niners: "sanfrancisco49ers",
-
-    seattleseahawks: "seattleseahawks",
-    seahawks: "seattleseahawks",
-
-    tampabaybuccaneers: "tampabaybuccaneers",
-    buccaneers: "tampabaybuccaneers",
-    bucs: "tampabaybuccaneers",
-
-    tennesseetitans: "tennesseetitans",
-    titans: "tennesseetitans",
-
-    washingtoncommanders: "washingtoncommanders",
-    commanders: "washingtoncommanders",
-    washingtonfootballteam: "washingtoncommanders",
-  };
-
-  if (map[x]) return map[x];
-
-  // fallback: keep as-is slug
-  return x;
+function toSlug(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
-const matchKey = (home, away) =>
-  `${canonicalTeam(home)}__${canonicalTeam(away)}`;
+// Very small DST helper for Eastern Time (US rules).
+function isUS_DST(dateUtc) {
+  const y = dateUtc.getUTCFullYear();
 
-// ---------- SportsData fetch ----------
-
-async function fetchSportsdataSchedule() {
-  const url = `https://api.sportsdata.io/v3/nfl/scores/json/Schedules/${encodeURIComponent(
-    SPORTSDATA_SEASON
-  )}?key=${encodeURIComponent(SPORTSDATA_API_KEY)}`;
-
-  const res = await fetch(url);
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`SportsData schedule failed ${res.status} ${txt}`.trim());
+  // Second Sunday in March
+  const march = new Date(Date.UTC(y, 2, 1));
+  let secondSunMar = null;
+  for (let i = 0, found = 0; i < 31; i++) {
+    const d = new Date(Date.UTC(y, 2, 1 + i));
+    if (d.getUTCDay() === 0) {
+      found++;
+      if (found === 2) {
+        secondSunMar = d;
+        break;
+      }
+    }
   }
 
-  const data = await res.json();
-  if (!Array.isArray(data)) {
-    throw new Error("SportsData schedule: unexpected response shape");
+  // First Sunday in November
+  const nov = new Date(Date.UTC(y, 10, 1));
+  let firstSunNov = null;
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(Date.UTC(y, 10, 1 + i));
+    if (d.getUTCDay() === 0) {
+      firstSunNov = d;
+      break;
+    }
   }
 
-  const map = new Map();
-
-  for (const g of data) {
-    const home = g.HomeTeam || g.HomeTeamName || g.HomeDisplayName;
-    const away = g.AwayTeam || g.AwayTeamName || g.AwayDisplayName;
-    if (!home || !away) continue;
-
-    // Prefer DateTimeUTC; fall back to DateTime if needed
-    const utc =
-      g.DateTimeUTC ||
-      g.DateTime ||
-      g.GameDate ||
-      null;
-
-    if (!utc) continue;
-
-    const kickoff = new Date(utc);
-    if (Number.isNaN(kickoff.getTime())) continue;
-
-    const key1 = matchKey(home, away);
-    const key2 = matchKey(away, home);
-
-    const payload = {
-      home,
-      away,
-      kickoff,
-      raw: utc,
-    };
-
-    map.set(key1, payload);
-    map.set(key2, payload);
-  }
-
-  console.log("SportsData schedule entries:", map.size);
-  return map;
+  if (!secondSunMar || !firstSunNov) return false;
+  return dateUtc >= secondSunMar && dateUtc < firstSunNov;
 }
 
-// ---------- DB helpers ----------
+// SportsDataIO docs: DateTime is Eastern local time (with DST).
+// Convert that to a UTC Date.
+function parseSportsdataUtc(game) {
+  let dt = game.DateTime || game.DateTimeUTC || null;
 
-async function getDbGames(client) {
-  const { rows } = await client.query(
-    `
-    SELECT id, week, home_team, away_team, kickoff
-    FROM games
-    WHERE kickoff IS NOT NULL
-      AND week >= $1
-    ORDER BY week, kickoff, id
-    `,
-    [MIN_WEEK]
+  if (!dt && game.Date && game.Time) {
+    dt = `${game.Date}T${game.Time}`;
+  }
+
+  if (!dt) return null;
+
+  // If already tagged as UTC, trust it.
+  if (dt.endsWith("Z")) {
+    const d = new Date(dt);
+    return isNaN(d) ? null : d;
+  }
+
+  // Parse "YYYY-MM-DDTHH:MM:SS" as Eastern, then convert to UTC.
+  const m = dt.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/
   );
-  return rows.map((r) => ({
-    id: r.id,
-    week: Number(r.week),
-    home_team: r.home_team,
-    away_team: r.away_team,
-    kickoff: new Date(r.kickoff),
-  }));
-}
+  if (!m) {
+    return null;
+  }
 
-async function updateKickoff(client, id, newKickoff) {
-  await client.query(
-    `
-    UPDATE games
-       SET kickoff = $1
-     WHERE id = $2
-    `,
-    [newKickoff.toISOString(), id]
+  const year = Number(m[1]);
+  const month = Number(m[2]); // 1-12
+  const day = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = Number(m[6] || 0);
+
+  // Start with a UTC date at the same wall-clock time.
+  const asUtc = new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second)
   );
-}
+  if (isNaN(asUtc)) return null;
 
-// ---------- Main ----------
+  // Decide ET offset at that date.
+  const dst = isUS_DST(asUtc);
+  const offsetHours = dst ? 4 : 5; // ET to UTC
+
+  // To get real UTC: add offset hours.
+  return new Date(asUtc.getTime() + offsetHours * 60 * 60 * 1000);
+}
 
 async function main() {
   console.log(
-    `Using DB=${DB_URL.replace(/:\/\/.*@/, "://***:***@")} SEASON=${SPORTSDATA_SEASON} MIN_WEEK=${MIN_WEEK} APPLY=${
-      APPLY ? "yes" : "no (dry)"
-    }`
+    `${APPLY ? "kickoffs:sync (APPLY=yes)" : "kickoffs:audit (APPLY=no)"} using ${SEASON}`
   );
 
   const client = new Client({
     connectionString: DB_URL,
     ssl: { rejectUnauthorized: false },
   });
+
   await client.connect();
 
-  const games = await getDbGames(client);
-  console.log("DB games to evaluate:", games.length);
+  const dbRes = await client.query(
+    "SELECT id, week, home_team, away_team, kickoff FROM games ORDER BY week, id"
+  );
+  const dbGames = dbRes.rows;
+  console.log("DB games loaded:", dbGames.length);
 
-  const schedule = await fetchSportsdataSchedule();
+  console.log("Fetching SportsDataIO schedule…");
+  const resp = await fetch(SCHEDULE_URL);
+  if (!resp.ok) {
+    console.error(
+      "FATAL: schedule fetch failed:",
+      resp.status,
+      await resp.text()
+    );
+    process.exit(1);
+  }
+  const schedule = await resp.json();
+  console.log("SportsDataIO schedule entries:", schedule.length);
 
-  let touched = 0;
-  const table = [];
+  // Build lookup: "away@home" -> { utc, week }
+  const schedMap = new Map();
+  for (const g of schedule) {
+    if (!g.HomeTeam || !g.AwayTeam) continue;
+    const key = `${toSlug(g.AwayTeam)}@${toSlug(g.HomeTeam)}`;
+    const utc = parseSportsdataUtc(g);
+    if (!utc || isNaN(utc)) continue;
+    schedMap.set(key, {
+      utc,
+      week: g.Week,
+      raw: g.DateTime || g.DateTimeUTC || "",
+    });
+  }
 
-  for (const g of games) {
-    const key = matchKey(g.home_team, g.away_team);
-    const apiGame = schedule.get(key);
-    if (!apiGame) continue;
+  const thresholdMin = 10; // only touch if off by >= 10 minutes
+  const updates = [];
 
-    const dbTs = g.kickoff.getTime();
-    const apiTs = apiGame.kickoff.getTime();
-    const deltaSec = Math.round((apiTs - dbTs) / 1000);
+  for (const g of dbGames) {
+    const key = `${toSlug(g.away_team)}@${toSlug(g.home_team)}`;
+    const s = schedMap.get(key);
+    if (!s) continue;
 
-    if (Math.abs(deltaSec) >= MAX_DELTA_SEC) {
-      table.push({
+    const dbKick =
+      g.kickoff != null ? new Date(g.kickoff) : null;
+    if (!dbKick || isNaN(dbKick)) continue;
+
+    const sdKick = s.utc;
+    const deltaMin = Math.round(
+      (sdKick.getTime() - dbKick.getTime()) / 60000
+    );
+
+    if (Math.abs(deltaMin) >= thresholdMin) {
+      updates.push({
         id: g.id,
         week: g.week,
-        deltaMin: deltaSec / 60,
-        db: g.kickoff.toISOString(),
-        api: apiGame.kickoff.toISOString(),
-        match: `${apiGame.away} @ ${apiGame.home}`,
+        home: g.home_team,
+        away: g.away_team,
+        oldUtc: dbKick.toISOString(),
+        newUtc: sdKick.toISOString(),
+        deltaMin,
       });
-
-      if (APPLY) {
-        await updateKickoff(client, g.id, apiGame.kickoff);
-        touched++;
-      }
     }
   }
 
-  if (table.length) {
-    console.log("Kickoff differences (|delta| >= 60s):");
-    console.table(table);
-  } else {
-    console.log("No kickoff differences >= 60s detected.");
+  if (!updates.length) {
+    console.log(
+      "No kickoff differences above threshold; nothing to change ✅"
+    );
+    await client.end();
+    return;
   }
 
-  console.log(`Updated rows: ${touched}`);
+  console.log(`Proposed updates (${updates.length}):`);
+  for (const u of updates) {
+    console.log(
+      `Week ${u.week} ${u.away} @ ${u.home}: ${u.oldUtc} -> ${u.newUtc} (${u.deltaMin} min)`
+    );
+  }
 
+  if (!APPLY) {
+    console.log(
+      "Dry run only. Re-run with `npm run kickoffs:sync` to apply."
+    );
+    await client.end();
+    return;
+  }
+
+  for (const u of updates) {
+    await client.query("UPDATE games SET kickoff = $1 WHERE id = $2", [
+      u.newUtc,
+      u.id,
+    ]);
+  }
+
+  console.log("Updates applied ✅");
   await client.end();
-
-  if (!APPLY && table.length > 0) {
-    console.log("Dry run only. Set APPLY=1 to write changes.");
-  }
 }
 
 main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(2);
+  console.error("Unhandled:", err);
+  process.exit(1);
 });
