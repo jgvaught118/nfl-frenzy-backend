@@ -42,7 +42,6 @@ function normalizeTeamName(name) {
 
 /**
  * Build lookup: `${week}|${away}|${home}` -> SportsData game
- * Uses HomeTeamName/AwayTeamName when available, falls back to HomeTeam/AwayTeam.
  */
 function buildScheduleMap(sched) {
   const map = new Map();
@@ -58,33 +57,34 @@ function buildScheduleMap(sched) {
 }
 
 /**
- * US DST rules helper (for America/New_York)
- * DST starts: 2nd Sunday in March
- * DST ends:   1st Sunday in November
+ * US DST rules helper (America/New_York).
+ * DST starts: 2nd Sunday in March (2am)
+ * DST ends:   1st Sunday in November (2am)
+ * We only need date-level accuracy for schedule conversions.
  */
 function isUsDstInEffect(year, month, day) {
-  // month: 1-12, day: 1-31 (local date in ET)
-  // Compute 2nd Sunday in March
+  // month: 1-12
+
+  // 2nd Sunday in March
   const marchFirst = new Date(Date.UTC(year, 2, 1)); // March = 2
-  const marchFirstDow = marchFirst.getUTCDay(); // 0=Sun
-  const firstSundayInMarch = marchFirstDow === 0 ? 1 : 8 - marchFirstDow;
+  const mDow = marchFirst.getUTCDay(); // 0=Sun
+  const firstSundayInMarch = mDow === 0 ? 1 : 8 - mDow;
   const secondSundayInMarch = firstSundayInMarch + 7;
-
-  // Compute 1st Sunday in November
-  const novFirst = new Date(Date.UTC(year, 10, 1)); // Nov = 10
-  const novFirstDow = novFirst.getUTCDay();
-  const firstSundayInNov = novFirstDow === 0 ? 1 : 8 - novFirstDow;
-
-  const mmdd = month * 100 + day;
   const dstStart = 3 * 100 + secondSundayInMarch; // MMDD
+
+  // 1st Sunday in November
+  const novFirst = new Date(Date.UTC(year, 10, 1)); // Nov = 10
+  const nDow = novFirst.getUTCDay();
+  const firstSundayInNov = nDow === 0 ? 1 : 8 - nDow;
   const dstEnd = 11 * 100 + firstSundayInNov; // MMDD
 
+  const mmdd = month * 100 + day;
   return mmdd >= dstStart && mmdd < dstEnd;
 }
 
 /**
- * Interpret a timezone-less DateTime string from SportsDataIO as
- * Eastern Time (America/New_York), then convert to UTC ISO string.
+ * Interpret a timezone-less string as Eastern Time (America/New_York),
+ * then convert to UTC ISO string.
  *
  * Example input: "2025-11-09T13:00:00" (1:00pm ET)
  */
@@ -115,7 +115,6 @@ function easternLocalToUtcIso(localStr) {
     return null;
   }
 
-  // Determine Eastern offset for that date
   const isDst = isUsDstInEffect(year, month, day);
   // Eastern offset relative to UTC: -4 (DST) or -5 (standard)
   const offsetMinutes = isDst ? -4 * 60 : -5 * 60;
@@ -131,29 +130,28 @@ function easternLocalToUtcIso(localStr) {
 }
 
 /**
- * Get canonical UTC kickoff from SportsDataIO for a game.
+ * Get canonical UTC kickoff from SportsDataIO.
  *
- * IMPORTANT:
- * - We DO NOT trust DateTimeUTC from this feed in your environment,
- *   because it has been consistently off.
- * - We treat DateTime as local Eastern time and convert -> UTC.
- * - If DateTime already has a timezone/offset, we respect it.
+ * KEY CHANGE:
+ * - We DO NOT trust any trailing "Z" or offset in the feed.
+ * - We normalize by stripping it and treating the base as Eastern time,
+ *   then convert Eastern -> UTC.
  */
 function getApiKickoffUtc(game) {
   let src = game.DateTime || game.DateTimeUTC;
   if (!src) return null;
 
-  // If includes explicit offset or Z, trust it directly.
-  if (/[zZ]$/.test(src) || /[+\-]\d\d:?\d\d$/.test(src)) {
+  // Strip any trailing Z or timezone offset; treat as naive local ET
+  const base = src.replace(/([zZ]|[+\-]\d\d:?\d\d)$/, "");
+
+  const iso = easternLocalToUtcIso(base);
+  if (!iso) {
+    // Fallback: last resort, try native parse (shouldn't normally be needed)
     const d = new Date(src);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toISOString();
-    }
-    // fall through to try as Eastern-local if parsing failed
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+    return null;
   }
 
-  // Otherwise: treat as Eastern local time (no offset in string).
-  const iso = easternLocalToUtcIso(src);
   return iso;
 }
 
