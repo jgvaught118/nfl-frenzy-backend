@@ -40,8 +40,8 @@ function normalizeTeamName(name) {
 }
 
 /**
- * Check whether a datetime string already includes timezone/offset info.
- * Examples that return true:
+ * Whether a datetime string already includes timezone/offset info.
+ * Examples:
  *  - "2025-11-07T01:15:00Z"
  *  - "2025-11-07T01:15:00+00:00"
  *  - "2025-11-07T01:15:00-05:00"
@@ -51,75 +51,78 @@ function hasExplicitTz(str) {
 }
 
 /**
- * Parse SportsDataIO DateTimeUTC / DateTime into a proper UTC Date.
- *
- * Rules:
- * - Prefer DateTimeUTC. SportsDataIO defines this as UTC.
- *   - If it lacks 'Z' or offset, we treat it as UTC and append 'Z'.
- * - If DateTimeUTC is missing/invalid, fall back to DateTime (local ET).
- *   - If DateTime has no offset, we treat it as US Eastern and convert:
- *     - During DST (approx Mar–early Nov): ET = UTC-4
- *     - Otherwise: ET = UTC-5
+ * US DST helpers (for correct ET→UTC conversion)
+ * DST: second Sunday in March @ 2am local
+ * Ends: first Sunday in November @ 2am local
+ * We'll approximate using UTC dates; good for NFL season.
  */
-function parseSportsDataUtc(dateTimeUtc, dateTimeEt) {
-  if (dateTimeUtc) {
-    const raw = String(dateTimeUtc).trim();
-    if (raw) {
-      let iso = raw;
-      if (!hasExplicitTz(iso)) {
-        // SportsDataIO says this is UTC, so force it.
-        iso = iso + "Z";
-      }
 
-      const d = new Date(iso);
-      if (!Number.isNaN(d.getTime())) {
-        return d;
-      }
-    }
-  }
+function getNthDowOfMonthUtc(year, monthIndex, dow, n) {
+  // monthIndex: 0-11, dow: 0=Sun..6=Sat
+  const firstOfMonth = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0));
+  const firstDow = firstOfMonth.getUTCDay();
+  const delta = (dow - firstDow + 7) % 7;
+  const day = 1 + delta + (n - 1) * 7;
+  return new Date(Date.UTC(year, monthIndex, day, 0, 0, 0));
+}
 
-  if (dateTimeEt) {
-    const raw = String(dateTimeEt).trim();
-    if (raw) {
-      if (hasExplicitTz(raw)) {
-        const d = new Date(raw);
-        if (!Number.isNaN(d.getTime())) return d;
-      } else {
-        // Treat as Eastern Time, convert to UTC.
-        // Heuristic DST rules good enough for NFL season.
-        // Create a Date assuming the given clock time is ET, then shift.
-        const base = new Date(raw + "Z");
-        if (!Number.isNaN(base.getTime())) {
-          const m = base.getUTCMonth() + 1; // 1-12
-          const dNum = base.getUTCDate();
+function getUsDstRangeUtc(year) {
+  // Second Sunday in March
+  const dstStart = getNthDowOfMonthUtc(year, 2, 0, 2); // March = 2
+  // First Sunday in November
+  const dstEnd = getNthDowOfMonthUtc(year, 10, 0, 1); // Nov = 10
+  return { dstStart, dstEnd };
+}
 
-          // US DST ends first Sunday in November; for 2025 that’s Nov 2.
-          const dstEndsMonth = 11;
-          const dstEndsDay = 2;
-          const isDst =
-            m < dstEndsMonth ||
-            (m === dstEndsMonth && dNum < dstEndsDay);
-
-          const offsetHours = isDst ? 4 : 5; // ET: UTC-4 (DST), UTC-5 (std)
-          // Local ET time + offsetHours = UTC
-          base.setUTCHours(base.getUTCHours() + offsetHours);
-          return base;
-        }
-      }
-    }
-  }
-
-  return null;
+function isUsEasternDst(dateUtc) {
+  const year = dateUtc.getUTCFullYear();
+  const { dstStart, dstEnd } = getUsDstRangeUtc(year);
+  return dateUtc >= dstStart && dateUtc < dstEnd;
 }
 
 /**
- * Get canonical UTC kickoff from SportsDataIO game object.
- * Returns ISO string in UTC, or null.
+ * Convert SportsDataIO DateTime (local ET) into canonical UTC ISO.
+ *
+ * Strategy:
+ * - Ignore DateTimeUTC because it has proven unreliable in your data.
+ * - Use DateTime:
+ *    - If it already has a timezone/offset, trust it.
+ *    - If it is naive (no offset), treat as US Eastern local time:
+ *        * Determine if that date is in DST.
+ *        * ET offset = UTC-4 (DST) or UTC-5 (standard).
+ *        * So UTC = local_ET + offsetHours.
  */
 function getApiKickoffUtc(game) {
-  const d = parseSportsDataUtc(game.DateTimeUTC, game.DateTime);
-  if (!d || Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+  const rawDt = game.DateTime;
+  if (!rawDt) return null;
+
+  const raw = String(rawDt).trim();
+  if (!raw) return null;
+
+  // If DateTime has explicit TZ, trust it directly
+  if (hasExplicitTz(raw)) {
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toISOString();
+    }
+    return null;
+  }
+
+  // Naive: treat as ET local time.
+  // Step 1: interpret the naive clock as if it were UTC just to get Y/M/D/H/M.
+  const pseudoUtc = new Date(raw + "Z");
+  if (Number.isNaN(pseudoUtc.getTime())) {
+    return null;
+  }
+
+  // Step 2: decide DST based on that date.
+  const isDst = isUsEasternDst(pseudoUtc);
+  const offsetHours = isDst ? 4 : 5; // ET = UTC-4 (DST) or UTC-5 (std)
+
+  // Step 3: real UTC time = local_ET + offset
+  pseudoUtc.setUTCHours(pseudoUtc.getUTCHours() + offsetHours);
+
+  return pseudoUtc.toISOString();
 }
 
 /**
