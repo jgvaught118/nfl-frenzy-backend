@@ -1,199 +1,333 @@
 /* eslint-disable no-console */
-// scripts/syncKickoffsFromSportsdata.js
+/**
+ * Sync all game kickoff times from SportsDataIO official schedule.
+ *
+ * Uses:
+ *  - SPORTSDATA_API_KEY
+ *  - SPORTSDATA_SEASON  (e.g. "2025REG")
+ *  - RW_DB (Railway Postgres URL) or DATABASE_URL
+ *
+ * Logic:
+ *  - Fetch full NFL schedule for the season from SportsDataIO.
+ *  - For each DB game (by week, home_team, away_team):
+ *      - Find matching SportsData game via canonicalized names.
+ *      - Use SportsData DateTimeUTC as the single source of truth.
+ *      - If |dbKickoff - apiKickoff| >= 60s, update DB kickoff.
+ *
+ * This avoids “blind +4 hours” and handles DST correctly.
+ */
+
 const { Client } = require("pg");
 const fetch = require("node-fetch");
 
 const {
-  RW_DB,
   SPORTSDATA_API_KEY,
-  SPORTSDATA_SEASON, // e.g., "2025REG"
-  ODDS_API_KEY,
+  SPORTSDATA_SEASON,
+  RW_DB,
+  DATABASE_URL,
 } = process.env;
 
-if (!RW_DB) throw new Error("Missing env RW_DB");
-if (!SPORTSDATA_API_KEY) throw new Error("Missing env SPORTSDATA_API_KEY");
-if (!SPORTSDATA_SEASON) throw new Error("Missing env SPORTSDATA_SEASON");
+if (!SPORTSDATA_API_KEY) {
+  console.error("Missing env: SPORTSDATA_API_KEY");
+  process.exit(2);
+}
+if (!SPORTSDATA_SEASON) {
+  console.error("Missing env: SPORTSDATA_SEASON (e.g. 2025REG)");
+  process.exit(2);
+}
 
-const DAYS_FOR_ODDS_CHECK = 10;   // cross-check window with The Odds API
-const UPDATE_THRESHOLD_MIN = 60;  // update only if |delta| >= 60 minutes
+const DB_URL = RW_DB || DATABASE_URL;
+if (!DB_URL) {
+  console.error("Missing env: RW_DB or DATABASE_URL");
+  process.exit(2);
+}
 
-function toUtcDate(s) {
-  // SportsDataIO typically returns ISO strings in UTC.
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+const APPLY = String(process.env.APPLY || "").toLowerCase() === "1";
+const MIN_WEEK = Number(process.env.MIN_WEEK || 1);
+const MAX_DELTA_SEC = 60; // if >= 60s difference, we correct
+
+// ---------- Helpers ----------
+
+const slug = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function canonicalTeam(raw) {
+  const x = slug(raw);
+
+  // direct map for standard NFL teams
+  const map = {
+    // full names / nicknames normalized
+    arizonacardinals: "arizonacardinals",
+    cardinals: "arizonacardinals",
+
+    atlantafalcons: "atlantafalcons",
+    falcons: "atlantafalcons",
+
+    baltimoreravens: "baltimoreravens",
+    ravens: "baltimoreravens",
+
+    buffalobills: "buffalobills",
+    bills: "buffalobills",
+
+    carolinapanthers: "carolinapanthers",
+    panthers: "carolinapanthers",
+
+    chicagobears: "chicagobears",
+    bears: "chicagobears",
+
+    cincinnatibengals: "cincinnatibengals",
+    bengals: "cincinnatibengals",
+
+    clevelandbrowns: "clevelandbrowns",
+    browns: "clevelandbrowns",
+
+    dallascowboys: "dallascowboys",
+    cowboys: "dallascowboys",
+
+    denverbroncos: "denverbroncos",
+    broncos: "denverbroncos",
+
+    detroitlions: "detroitlions",
+    lions: "detroitlions",
+
+    greenbaypackers: "greenbaypackers",
+    packers: "greenbaypackers",
+    gbpackers: "greenbaypackers",
+
+    houstontexans: "houstontexans",
+    texans: "houstontexans",
+
+    indianapolisco lts: "indianapoliscolts",
+    indianapoliscolts: "indianapoliscolts",
+    colts: "indianapoliscolts",
+
+    jacksonvillejaguars: "jacksonvillejaguars",
+    jags: "jacksonvillejaguars",
+    jaguars: "jacksonvillejaguars",
+
+    kansascitychiefs: "kansascitychiefs",
+    chiefs: "kansascitychiefs",
+    kcchiefs: "kansascitychiefs",
+
+    lasvegasraiders: "lasvegasraiders",
+    raiders: "lasvegasraiders",
+
+    losangeleschargers: "losangeleschargers",
+    chargers: "losangeleschargers",
+    lachargers: "losangeleschargers",
+
+    losangelesrams: "losangelesrams",
+    rams: "losangelesrams",
+    larams: "losangelesrams",
+
+    miamidolphins: "miamidolphins",
+    dolphins: "miamidolphins",
+
+    minnesotavikings: "minnesotavikings",
+    vikings: "minnesotavikings",
+
+    newenglandpatriots: "newenglandpatriots",
+    patriots: "newenglandpatriots",
+    nepatriots: "newenglandpatriots",
+
+    neworleanssaints: "neworleanssaints",
+    saints: "neworleanssaints",
+
+    newyorkgiants: "newyorkgiants",
+    giants: "newyorkgiants",
+    nygiants: "newyorkgiants",
+
+    newyorkjets: "newyorkjets",
+    jets: "newyorkjets",
+    nyjets: "newyorkjets",
+
+    philadelphiaeagles: "philadelphiaeagles",
+    eagles: "philadelphiaeagles",
+
+    pittsburghsteelers: "pittsburghsteelers",
+    steelers: "pittsburghsteelers",
+
+    sanfrancisco49ers: "sanfrancisco49ers",
+    "49ers": "sanfrancisco49ers",
+    niners: "sanfrancisco49ers",
+
+    seattleseahawks: "seattleseahawks",
+    seahawks: "seattleseahawks",
+
+    tampabaybuccaneers: "tampabaybuccaneers",
+    buccaneers: "tampabaybuccaneers",
+    bucs: "tampabaybuccaneers",
+
+    tennesseetitans: "tennesseetitans",
+    titans: "tennesseetitans",
+
+    washingtoncommanders: "washingtoncommanders",
+    commanders: "washingtoncommanders",
+    washingtonfootballteam: "washingtoncommanders",
+  };
+
+  if (map[x]) return map[x];
+
+  // fallback: keep as-is slug
+  return x;
 }
-function minutes(a, b) {
-  return Math.round((a.getTime() - b.getTime()) / 60000);
-}
-function slugTeam(s) {
-  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-function keyMatch(home, away) {
-  return `${slugTeam(home)}__${slugTeam(away)}`;
-}
+
+const matchKey = (home, away) =>
+  `${canonicalTeam(home)}__${canonicalTeam(away)}`;
+
+// ---------- SportsData fetch ----------
 
 async function fetchSportsdataSchedule() {
-  // Example: https://api.sportsdata.io/v3/nfl/scores/json/Schedules/2025REG?key=API_KEY
-  const base = "https://api.sportsdata.io/v3/nfl/scores/json";
-  const url = `${base}/Schedules/${encodeURIComponent(SPORTSDATA_SEASON)}?key=${encodeURIComponent(SPORTSDATA_API_KEY)}`;
+  const url = `https://api.sportsdata.io/v3/nfl/scores/json/Schedules/${encodeURIComponent(
+    SPORTSDATA_SEASON
+  )}?key=${encodeURIComponent(SPORTSDATA_API_KEY)}`;
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`SportsData schedules failed ${res.status}`);
-  const arr = await res.json();
-  const map = new Map();
-  for (const g of arr || []) {
-    // Fields vary by plan; prefer UTC date fields when present.
-    const home = g.HomeTeam || g.HomeTeamName || g.HomeTeamKey || g.HomeTeamID;
-    const away = g.AwayTeam || g.AwayTeamName || g.AwayTeamKey || g.AwayTeamID;
-    const iso = g.Date || g.DateTime || g.GameTime || g.Updated || null;
-
-    if (!home || !away || !iso) continue;
-    const when = toUtcDate(iso);
-    if (!when) continue;
-
-    map.set(keyMatch(home, away), { when, src: "sportsdata", raw: g });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`SportsData schedule failed ${res.status} ${txt}`.trim());
   }
+
+  const data = await res.json();
+  if (!Array.isArray(data)) {
+    throw new Error("SportsData schedule: unexpected response shape");
+  }
+
+  const map = new Map();
+
+  for (const g of data) {
+    const home = g.HomeTeam || g.HomeTeamName || g.HomeDisplayName;
+    const away = g.AwayTeam || g.AwayTeamName || g.AwayDisplayName;
+    if (!home || !away) continue;
+
+    // Prefer DateTimeUTC; fall back to DateTime if needed
+    const utc =
+      g.DateTimeUTC ||
+      g.DateTime ||
+      g.GameDate ||
+      null;
+
+    if (!utc) continue;
+
+    const kickoff = new Date(utc);
+    if (Number.isNaN(kickoff.getTime())) continue;
+
+    const key1 = matchKey(home, away);
+    const key2 = matchKey(away, home);
+
+    const payload = {
+      home,
+      away,
+      kickoff,
+      raw: utc,
+    };
+
+    map.set(key1, payload);
+    map.set(key2, payload);
+  }
+
+  console.log("SportsData schedule entries:", map.size);
   return map;
 }
 
-async function fetchOddsCommenceMap() {
-  if (!ODDS_API_KEY) return new Map();
-  // Only need upcoming window; the Odds API doesn’t page season-long.
-  const url = `https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us,us2&markets=spreads&oddsFormat=american&dateFormat=iso&apiKey=${encodeURIComponent(ODDS_API_KEY)}`;
-  const res = await fetch(url);
-  if (!res.ok) return new Map();
+// ---------- DB helpers ----------
 
-  const arr = await res.json();
-  const now = Date.now();
-  const horizon = now + DAYS_FOR_ODDS_CHECK * 24 * 3600 * 1000;
-
-  const map = new Map();
-  for (const e of arr || []) {
-    const home = e.home_team, away = e.away_team;
-    const iso = e.commence_time;
-    if (!home || !away || !iso) continue;
-    const dt = toUtcDate(iso);
-    if (!dt) continue;
-
-    // Only include games within the horizon
-    if (dt.getTime() <= horizon) {
-      map.set(keyMatch(home, away), { when: dt, src: "odds" });
-    }
-  }
-  return map;
-}
-
-async function getCurrentWeek(client) {
-  const { rows } = await client.query(`
-    SELECT COALESCE(MAX(week) FILTER (WHERE kickoff <= now()), MIN(week)) AS w
-    FROM games;
-  `);
-  return Number(rows[0].w);
-}
-
-async function loadDbGamesFromWeek(client, weekMin) {
-  const { rows } = await client.query(`
+async function getDbGames(client) {
+  const { rows } = await client.query(
+    `
     SELECT id, week, home_team, away_team, kickoff
     FROM games
-    WHERE week >= $1
+    WHERE kickoff IS NOT NULL
+      AND week >= $1
     ORDER BY week, kickoff, id
-  `, [weekMin]);
-  return rows.map(r => ({
-    ...r,
-    kickoff: r.kickoff ? new Date(r.kickoff) : null,
+    `,
+    [MIN_WEEK]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    week: Number(r.week),
+    home_team: r.home_team,
+    away_team: r.away_team,
+    kickoff: new Date(r.kickoff),
   }));
 }
 
-async function updateKickoff(client, id, whenUtc) {
-  const q = `
+async function updateKickoff(client, id, newKickoff) {
+  await client.query(
+    `
     UPDATE games
        SET kickoff = $1
      WHERE id = $2
-  `;
-  await client.query(q, [whenUtc.toISOString(), id]);
+    `,
+    [newKickoff.toISOString(), id]
+  );
 }
 
-(async function main() {
-  const client = new Client({ connectionString: RW_DB, ssl: { rejectUnauthorized: false } });
+// ---------- Main ----------
+
+async function main() {
+  console.log(
+    `Using DB=${DB_URL.replace(/:\/\/.*@/, "://***:***@")} SEASON=${SPORTSDATA_SEASON} MIN_WEEK=${MIN_WEEK} APPLY=${
+      APPLY ? "yes" : "no (dry)"
+    }`
+  );
+
+  const client = new Client({
+    connectionString: DB_URL,
+    ssl: { rejectUnauthorized: false },
+  });
   await client.connect();
 
-  const cur = await getCurrentWeek(client);
-  const weekMin = cur + 1; // only future weeks (no global lock impact from already-started games)
-  const dbRows = await loadDbGamesFromWeek(client, weekMin);
+  const games = await getDbGames(client);
+  console.log("DB games to evaluate:", games.length);
 
-  console.log(`DB future rows (week >= ${weekMin}): ${dbRows.length}`);
+  const schedule = await fetchSportsdataSchedule();
 
-  const sdMap = await fetchSportsdataSchedule();
-  console.log(`SportsData schedule entries: ${sdMap.size}`);
+  let touched = 0;
+  const table = [];
 
-  const oddsMap = await fetchOddsCommenceMap();
-  console.log(`Odds commence entries (<= ${DAYS_FOR_ODDS_CHECK}d): ${oddsMap.size}`);
+  for (const g of games) {
+    const key = matchKey(g.home_team, g.away_team);
+    const apiGame = schedule.get(key);
+    if (!apiGame) continue;
 
-  const pending = [];
-  const audit = [];
+    const dbTs = g.kickoff.getTime();
+    const apiTs = apiGame.kickoff.getTime();
+    const deltaSec = Math.round((apiTs - dbTs) / 1000);
 
-  for (const g of dbRows) {
-    const k = keyMatch(g.home_team, g.away_team);
-    const sd = sdMap.get(k);
-    if (!sd) {
-      audit.push({ id: g.id, week: g.week, issue: "no-sportsdata-match", home: g.home_team, away: g.away_team });
-      continue;
-    }
+    if (Math.abs(deltaSec) >= MAX_DELTA_SEC) {
+      table.push({
+        id: g.id,
+        week: g.week,
+        deltaMin: deltaSec / 60,
+        db: g.kickoff.toISOString(),
+        api: apiGame.kickoff.toISOString(),
+        match: `${apiGame.away} @ ${apiGame.home}`,
+      });
 
-    const dbWhen = g.kickoff;
-    const sdWhen = sd.when;
-    const deltaToSD = dbWhen ? minutes(sdWhen, dbWhen) : null;
-
-    // Optional: if within near horizon, compare Odds commence as a second opinion
-    const o = oddsMap.get(k);
-    const deltaOddsVsSD = o ? minutes(o.when, sdWhen) : null;
-
-    audit.push({
-      id: g.id,
-      week: g.week,
-      db: dbWhen ? dbWhen.toISOString() : null,
-      sportsdata: sdWhen.toISOString(),
-      odds: o ? o.when.toISOString() : null,
-      delta_db_vs_sd_min: deltaToSD,
-      delta_odds_vs_sd_min: deltaOddsVsSD,
-    });
-
-    // Update policy:
-    // - Trust SportsData (UTC, DST-aware).
-    // - Only update when |delta| >= UPDATE_THRESHOLD_MIN to avoid churn.
-    if (deltaToSD === null || Math.abs(deltaToSD) >= UPDATE_THRESHOLD_MIN) {
-      pending.push({ id: g.id, to: sdWhen });
+      if (APPLY) {
+        await updateKickoff(client, g.id, apiGame.kickoff);
+        touched++;
+      }
     }
   }
 
-  if (pending.length) {
-    console.log(`Updating ${pending.length} games to SportsData UTC times...`);
-    for (const p of pending) {
-      await updateKickoff(client, p.id, p.to);
-    }
+  if (table.length) {
+    console.log("Kickoff differences (|delta| >= 60s):");
+    console.table(table);
   } else {
-    console.log("No games required kickoff updates.");
+    console.log("No kickoff differences >= 60s detected.");
   }
 
-  // Helpful summary rows with large disagreement (≥ 30 min) to eyeball
-  const noisy = audit.filter(r => {
-    const d = r.delta_db_vs_sd_min;
-    return typeof d === "number" && Math.abs(d) >= 30;
-  });
-  if (noisy.length) {
-    console.table(noisy.map(r => ({
-      id: r.id,
-      week: r.week,
-      delta_db_vs_sd_min: r.delta_db_vs_sd_min,
-      db: r.db,
-      sportsdata: r.sportsdata,
-      odds: r.odds,
-      delta_odds_vs_sd_min: r.delta_odds_vs_sd_min,
-    })));
-  }
+  console.log(`Updated rows: ${touched}`);
 
   await client.end();
-})().catch(e => {
-  console.error("Fatal:", e);
+
+  if (!APPLY && table.length > 0) {
+    console.log("Dry run only. Set APPLY=1 to write changes.");
+  }
+}
+
+main().catch((err) => {
+  console.error("Fatal:", err);
   process.exit(2);
 });
