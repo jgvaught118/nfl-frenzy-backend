@@ -6,6 +6,7 @@ const axios = require("axios");
 
 const { Client } = pg;
 
+// APPLY mode: true for `npm run kickoffs:sync`, false for `kickoffs:audit`
 const APPLY =
   process.env.npm_lifecycle_event === "kickoffs:sync" ||
   process.argv.includes("--apply");
@@ -40,92 +41,6 @@ function normalizeTeamName(name) {
 }
 
 /**
- * Whether a datetime string already includes timezone/offset info.
- * Examples:
- *  - "2025-11-07T01:15:00Z"
- *  - "2025-11-07T01:15:00+00:00"
- *  - "2025-11-07T01:15:00-05:00"
- */
-function hasExplicitTz(str) {
-  return /([zZ]|[+\-]\d{2}:?\d{2})$/.test(str);
-}
-
-/**
- * US DST helpers (for correct ET→UTC conversion)
- * DST: second Sunday in March @ 2am local
- * Ends: first Sunday in November @ 2am local
- * We'll approximate using UTC dates; good for NFL season.
- */
-
-function getNthDowOfMonthUtc(year, monthIndex, dow, n) {
-  // monthIndex: 0-11, dow: 0=Sun..6=Sat
-  const firstOfMonth = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0));
-  const firstDow = firstOfMonth.getUTCDay();
-  const delta = (dow - firstDow + 7) % 7;
-  const day = 1 + delta + (n - 1) * 7;
-  return new Date(Date.UTC(year, monthIndex, day, 0, 0, 0));
-}
-
-function getUsDstRangeUtc(year) {
-  // Second Sunday in March
-  const dstStart = getNthDowOfMonthUtc(year, 2, 0, 2); // March = 2
-  // First Sunday in November
-  const dstEnd = getNthDowOfMonthUtc(year, 10, 0, 1); // Nov = 10
-  return { dstStart, dstEnd };
-}
-
-function isUsEasternDst(dateUtc) {
-  const year = dateUtc.getUTCFullYear();
-  const { dstStart, dstEnd } = getUsDstRangeUtc(year);
-  return dateUtc >= dstStart && dateUtc < dstEnd;
-}
-
-/**
- * Convert SportsDataIO DateTime (local ET) into canonical UTC ISO.
- *
- * Strategy:
- * - Ignore DateTimeUTC because it has proven unreliable in your data.
- * - Use DateTime:
- *    - If it already has a timezone/offset, trust it.
- *    - If it is naive (no offset), treat as US Eastern local time:
- *        * Determine if that date is in DST.
- *        * ET offset = UTC-4 (DST) or UTC-5 (standard).
- *        * So UTC = local_ET + offsetHours.
- */
-function getApiKickoffUtc(game) {
-  const rawDt = game.DateTime;
-  if (!rawDt) return null;
-
-  const raw = String(rawDt).trim();
-  if (!raw) return null;
-
-  // If DateTime has explicit TZ, trust it directly
-  if (hasExplicitTz(raw)) {
-    const d = new Date(raw);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toISOString();
-    }
-    return null;
-  }
-
-  // Naive: treat as ET local time.
-  // Step 1: interpret the naive clock as if it were UTC just to get Y/M/D/H/M.
-  const pseudoUtc = new Date(raw + "Z");
-  if (Number.isNaN(pseudoUtc.getTime())) {
-    return null;
-  }
-
-  // Step 2: decide DST based on that date.
-  const isDst = isUsEasternDst(pseudoUtc);
-  const offsetHours = isDst ? 4 : 5; // ET = UTC-4 (DST) or UTC-5 (std)
-
-  // Step 3: real UTC time = local_ET + offset
-  pseudoUtc.setUTCHours(pseudoUtc.getUTCHours() + offsetHours);
-
-  return pseudoUtc.toISOString();
-}
-
-/**
  * Build lookup: `${week}|${away}|${home}` -> SportsData game
  * Uses HomeTeamName/AwayTeamName when available, falls back to HomeTeam/AwayTeam.
  */
@@ -140,6 +55,106 @@ function buildScheduleMap(sched) {
     map.set(key, g);
   }
   return map;
+}
+
+/**
+ * US DST rules helper (for America/New_York)
+ * DST starts: 2nd Sunday in March
+ * DST ends:   1st Sunday in November
+ */
+function isUsDstInEffect(year, month, day) {
+  // month: 1-12, day: 1-31 (local date in ET)
+  // Compute 2nd Sunday in March
+  const marchFirst = new Date(Date.UTC(year, 2, 1)); // March = 2
+  const marchFirstDow = marchFirst.getUTCDay(); // 0=Sun
+  const firstSundayInMarch = marchFirstDow === 0 ? 1 : 8 - marchFirstDow;
+  const secondSundayInMarch = firstSundayInMarch + 7;
+
+  // Compute 1st Sunday in November
+  const novFirst = new Date(Date.UTC(year, 10, 1)); // Nov = 10
+  const novFirstDow = novFirst.getUTCDay();
+  const firstSundayInNov = novFirstDow === 0 ? 1 : 8 - novFirstDow;
+
+  const mmdd = month * 100 + day;
+  const dstStart = 3 * 100 + secondSundayInMarch; // MMDD
+  const dstEnd = 11 * 100 + firstSundayInNov; // MMDD
+
+  return mmdd >= dstStart && mmdd < dstEnd;
+}
+
+/**
+ * Interpret a timezone-less DateTime string from SportsDataIO as
+ * Eastern Time (America/New_York), then convert to UTC ISO string.
+ *
+ * Example input: "2025-11-09T13:00:00" (1:00pm ET)
+ */
+function easternLocalToUtcIso(localStr) {
+  if (!localStr || typeof localStr !== "string") return null;
+
+  const [datePart, timePart] = localStr.split("T");
+  if (!datePart || !timePart) return null;
+
+  const [yearStr, monthStr, dayStr] = datePart.split("-");
+  const [hourStr, minStr, secStr = "00"] = timePart.split(":");
+
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const hour = Number(hourStr);
+  const minute = Number(minStr);
+  const second = Number(secStr);
+
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(minute) ||
+    !Number.isFinite(second)
+  ) {
+    return null;
+  }
+
+  // Determine Eastern offset for that date
+  const isDst = isUsDstInEffect(year, month, day);
+  // Eastern offset relative to UTC: -4 (DST) or -5 (standard)
+  const offsetMinutes = isDst ? -4 * 60 : -5 * 60;
+
+  // local(ET) = UTC + offset  =>  UTC = local - offset
+  const utcMs =
+    Date.UTC(year, month - 1, day, hour, minute, second) -
+    offsetMinutes * 60 * 1000;
+
+  const d = new Date(utcMs);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+/**
+ * Get canonical UTC kickoff from SportsDataIO for a game.
+ *
+ * IMPORTANT:
+ * - We DO NOT trust DateTimeUTC from this feed in your environment,
+ *   because it has been consistently off.
+ * - We treat DateTime as local Eastern time and convert -> UTC.
+ * - If DateTime already has a timezone/offset, we respect it.
+ */
+function getApiKickoffUtc(game) {
+  let src = game.DateTime || game.DateTimeUTC;
+  if (!src) return null;
+
+  // If includes explicit offset or Z, trust it directly.
+  if (/[zZ]$/.test(src) || /[+\-]\d\d:?\d\d$/.test(src)) {
+    const d = new Date(src);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toISOString();
+    }
+    // fall through to try as Eastern-local if parsing failed
+  }
+
+  // Otherwise: treat as Eastern local time (no offset in string).
+  const iso = easternLocalToUtcIso(src);
+  return iso;
 }
 
 async function main() {
@@ -177,7 +192,6 @@ async function main() {
     const schedMap = buildScheduleMap(schedule);
     let updates = 0;
 
-    // 3) Compare & update
     for (const db of dbGames) {
       const key = `${db.week}|${normalizeTeamName(
         db.away_team
@@ -186,18 +200,13 @@ async function main() {
       if (!apiGame) continue;
 
       const apiKickoffUtc = getApiKickoffUtc(apiGame);
-      if (!apiKickoffUtc) {
-        console.warn(
-          `[WARN] No valid API kickoff for w${db.week} ${db.away_team} @ ${db.home_team}`
-        );
-        continue;
-      }
+      if (!apiKickoffUtc) continue;
 
       const dbKickoffIso = db.kickoff
         ? new Date(db.kickoff).toISOString()
         : null;
 
-      // If DB empty -> set it
+      // If DB empty -> set
       if (!dbKickoffIso) {
         console.log(
           `[SET ] id=${db.id} w${db.week} ${db.away_team} @ ${db.home_team}
@@ -214,7 +223,7 @@ async function main() {
         continue;
       }
 
-      // Compare; only update if off by > 60 seconds
+      // Compare and update if off by more than 1 minute
       const diffMs =
         new Date(apiKickoffUtc).getTime() -
         new Date(dbKickoffIso).getTime();
