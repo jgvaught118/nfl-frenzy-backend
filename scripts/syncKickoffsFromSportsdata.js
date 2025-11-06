@@ -1,223 +1,188 @@
 // scripts/syncKickoffsFromSportsdata.js
-// Sync kickoff times from SportsDataIO into `games.kickoff` as TRUE UTC.
-// Usage:
-//   npm run kickoffs:audit   # dry-run
-//   npm run kickoffs:sync    # apply fixes
-//
-// Requires env:
-//   SPORTSDATA_API_KEY
-//   SPORTSDATA_SEASON (e.g. "2025REG")
-//   RW_DB or DATABASE_URL (your Railway URL)
 
-require("dotenv").config();
-const fetch = require("node-fetch");
-const { Client } = require("pg");
+import "dotenv/config";
+import pg from "pg";
+import axios from "axios";
 
-const LIFECYCLE = process.env.npm_lifecycle_event || "";
+const { Client } = pg;
+
 const APPLY =
-  LIFECYCLE === "kickoffs:sync" ||
-  process.env.APPLY === "1";
+  process.env.npm_lifecycle_event === "kickoffs:sync" ||
+  process.argv.includes("--apply");
 
-const SEASON = process.env.SPORTSDATA_SEASON || "2025REG";
-const API_KEY = process.env.SPORTSDATA_API_KEY;
-const DB_URL = process.env.RW_DB || process.env.DATABASE_URL;
+const {
+  RW_DB,
+  SPORTSDATA_API_KEY,
+  SPORTSDATA_SEASON = "2025REG",
+} = process.env;
 
-if (!API_KEY) {
+if (!RW_DB) {
+  console.error("FATAL: RW_DB not set.");
+  process.exit(1);
+}
+if (!SPORTSDATA_API_KEY) {
   console.error("FATAL: SPORTSDATA_API_KEY not set.");
   process.exit(1);
 }
-if (!DB_URL) {
-  console.error("FATAL: RW_DB or DATABASE_URL not set.");
-  process.exit(1);
+
+const SPORTS_DATA_BASE_URL =
+  "https://api.sportsdata.io/v3/nfl/scores/json/Schedules";
+
+/**
+ * Normalize team names between DB and SportsDataIO.
+ * DB uses full names, SportsDataIO uses Team + maybe suffix.
+ */
+function normalizeTeamName(name) {
+  if (!name) return "";
+  return name
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ");
 }
 
-console.log(
-  `${LIFECYCLE || "kickoffs:script"} (APPLY=${APPLY ? "yes" : "no"}) using ${SEASON}`
-);
+/**
+ * Build a quick lookup map for schedule entries:
+ * key: `${week}|${away}|${home}` all normalized
+ */
+function buildScheduleMap(sched) {
+  const map = new Map();
+  for (const g of sched) {
+    const week = g.Week;
+    const home = normalizeTeamName(g.HomeTeamName || g.HomeTeam);
+    const away = normalizeTeamName(g.AwayTeamName || g.AwayTeam);
+    if (!week || !home || !away) continue;
 
-const TEAM_MAP = {
-  ARI: "Arizona Cardinals",
-  ATL: "Atlanta Falcons",
-  BAL: "Baltimore Ravens",
-  BUF: "Buffalo Bills",
-  CAR: "Carolina Panthers",
-  CHI: "Chicago Bears",
-  CIN: "Cincinnati Bengals",
-  CLE: "Cleveland Browns",
-  DAL: "Dallas Cowboys",
-  DEN: "Denver Broncos",
-  DET: "Detroit Lions",
-  GB: "Green Bay Packers",
-  HOU: "Houston Texans",
-  IND: "Indianapolis Colts",
-  JAX: "Jacksonville Jaguars",
-  KC: "Kansas City Chiefs",
-  LV: "Las Vegas Raiders",
-  LAC: "Los Angeles Chargers",
-  LAR: "Los Angeles Rams",
-  MIA: "Miami Dolphins",
-  MIN: "Minnesota Vikings",
-  NE: "New England Patriots",
-  NO: "New Orleans Saints",
-  NYG: "New York Giants",
-  NYJ: "New York Jets",
-  PHI: "Philadelphia Eagles",
-  PIT: "Pittsburgh Steelers",
-  SEA: "Seattle Seahawks",
-  SF: "San Francisco 49ers",
-  TB: "Tampa Bay Buccaneers",
-  TEN: "Tennessee Titans",
-  WSH: "Washington Commanders",
-};
-
-function mapTeams(homeCode, awayCode) {
-  const home = TEAM_MAP[homeCode];
-  const away = TEAM_MAP[awayCode];
-  if (!home || !away) return null;
-  return { home, away };
-}
-
-function parseUtc(dtUtc, dtLocal) {
-  // Prefer DateTimeUTC if present and parseable
-  if (dtUtc) {
-    const d = new Date(dtUtc);
-    if (!Number.isNaN(d.getTime())) return d;
+    const key = `${week}|${away}|${home}`;
+    map.set(key, g);
   }
-  // Fallback: if only DateTime is provided and clearly has a timezone,
-  // let JS parse it. If it's a naive local time, we *don't* trust it here.
-  if (dtLocal) {
-    const d = new Date(dtLocal);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  return null;
+  return map;
 }
 
-function isPlaceholderMidnight(date) {
-  if (!date) return false;
-  return (
-    date.getUTCHours() === 0 &&
-    date.getUTCMinutes() === 0 &&
-    date.getUTCSeconds() === 0
-  );
+/**
+ * Get correct UTC kickoff from SportsDataIO entry.
+ *
+ * We ONLY trust DateTimeUTC here.
+ */
+function getApiKickoffUtc(game) {
+  // SportsDataIO docs: DateTimeUTC is ISO-8601 in UTC.
+  const utc = game.DateTimeUTC || game.DateTime;
+  if (!utc) return null;
+
+  const d = new Date(utc);
+  if (Number.isNaN(d.getTime())) return null;
+
+  // Ensure we return a canonical Z string
+  return d.toISOString();
 }
 
 async function main() {
-  const client = new Client({
-    connectionString: DB_URL,
-    ssl: { rejectUnauthorized: false },
-  });
-
-  await client.connect();
-
-  const { rows: games } = await client.query(
-    `SELECT id, week, home_team, away_team, kickoff
-     FROM games
-     ORDER BY week, id`
+  console.log(
+    `kickoffs:${APPLY ? "sync" : "audit"} (APPLY=${
+      APPLY ? "yes" : "no"
+    }) using ${SPORTSDATA_SEASON}`
   );
 
-  console.log(`DB games loaded: ${games.length}`);
+  const client = new Client({ connectionString: RW_DB });
+  await client.connect();
 
-  const url = `https://api.sportsdata.io/v3/nfl/scores/json/Schedules/${SEASON}?key=${API_KEY}`;
-  console.log("Fetching SportsDataIO schedule…");
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`SportsDataIO Schedules HTTP ${res.status}`);
-  }
-  const schedule = await res.json();
-  console.log(`SportsDataIO schedule entries: ${schedule.length}`);
+  try {
+    // 1) Load DB games
+    const dbRes = await client.query(
+      `SELECT id, week, home_team, away_team, kickoff
+       FROM games
+       WHERE week >= 1
+       ORDER BY week, id`
+    );
+    const dbGames = dbRes.rows;
+    console.log("DB games loaded:", dbGames.length);
 
-  // Index schedule by normalized "Home Team Name|Away Team Name"
-  const schedIndex = new Map();
-
-  for (const s of schedule) {
-    const map = mapTeams(s.HomeTeam, s.AwayTeam);
-    if (!map) continue;
-
-    const key = `${map.home}|${map.away}`;
-    const candidateUtc = parseUtc(s.DateTimeUTC, s.DateTime);
-
-    // Prefer entries with a real UTC time
-    if (!schedIndex.has(key)) {
-      schedIndex.set(key, { ...s, mappedHome: map.home, mappedAway: map.away, kickoffUtc: candidateUtc });
-    } else {
-      const existing = schedIndex.get(key);
-      if (!existing.kickoffUtc && candidateUtc) {
-        schedIndex.set(key, { ...s, mappedHome: map.home, mappedAway: map.away, kickoffUtc: candidateUtc });
+    // 2) Load SportsDataIO schedule (entire season)
+    console.log("Fetching SportsDataIO schedule…");
+    const apiRes = await axios.get(
+      `${SPORTS_DATA_BASE_URL}/${SPORTSDATA_SEASON}`,
+      {
+        headers: { "Ocp-Apim-Subscription-Key": SPORTSDATA_API_KEY },
       }
-    }
-  }
+    );
+    const schedule = apiRes.data || [];
+    console.log("SportsDataIO schedule entries:", schedule.length);
 
-  const THRESH_MS = 60 * 60 * 1000; // 60 minutes
+    const schedMap = buildScheduleMap(schedule);
 
-  let updateCount = 0;
+    let updates = 0;
 
-  for (const g of games) {
-    const key = `${g.home_team}|${g.away_team}`;
-    const s = schedIndex.get(key);
+    for (const db of dbGames) {
+      const key = `${db.week}|${normalizeTeamName(
+        db.away_team
+      )}|${normalizeTeamName(db.home_team)}`;
+      const apiGame = schedMap.get(key);
+      if (!apiGame) {
+        // silently skip if no exact match (preseason, etc.)
+        continue;
+      }
 
-    if (!s) {
-      // No schedule match; skip quietly (pre/postseason, data drift, etc.)
-      continue;
-    }
+      const apiKickoffUtc = getApiKickoffUtc(apiGame);
+      if (!apiKickoffUtc) continue;
 
-    const sdUtc = s.kickoffUtc;
-    if (!sdUtc) {
-      // If SportsDataIO still has no real time (TBD), do not force junk into DB.
-      continue;
-    }
+      const dbKickoff = db.kickoff
+        ? new Date(db.kickoff).toISOString()
+        : null;
 
-    // Ignore obvious placeholder midnight times to avoid early global lock
-    if (isPlaceholderMidnight(sdUtc)) {
-      continue;
-    }
-
-    const dbUtc = g.kickoff ? new Date(g.kickoff) : null;
-
-    if (!dbUtc || Number.isNaN(dbUtc.getTime())) {
-      console.log(
-        `[MISS] id=${g.id} w${g.week} ${g.away_team} @ ${g.home_team} has no valid kickoff;`
-        + ` would set -> ${sdUtc.toISOString()}`
-      );
-      if (APPLY) {
-        await client.query(
-          "UPDATE games SET kickoff = $1 WHERE id = $2",
-          [sdUtc.toISOString(), g.id]
+      // If DB empty or differs by more than 60 seconds, update
+      if (!dbKickoff) {
+        console.log(
+          `[SET ] id=${db.id} w${db.week} ${db.away_team} @ ${db.home_team}
+     DB:  (null)
+     API: ${apiKickoffUtc}`
         );
-        updateCount++;
+        if (APPLY) {
+          await client.query(
+            "UPDATE games SET kickoff = $1 WHERE id = $2",
+            [apiKickoffUtc, db.id]
+          );
+        }
+        updates++;
+        continue;
       }
-      continue;
-    }
 
-    const delta = sdUtc.getTime() - dbUtc.getTime();
-    const absDelta = Math.abs(delta);
+      const diffMs =
+        new Date(apiKickoffUtc).getTime() -
+        new Date(dbKickoff).getTime();
+      const diffMin = Math.abs(diffMs) / 60000;
 
-    if (absDelta >= THRESH_MS) {
-      console.log(
-        `[FIX] id=${g.id} w${g.week} ${g.away_team} @ ${g.home_team}\n`
-        + `     DB:  ${dbUtc.toISOString()}\n`
-        + `     API: ${sdUtc.toISOString()}\n`
-        + `     Δ = ${(delta / 60000).toFixed(1)} min`
-      );
-      if (APPLY) {
-        await client.query(
-          "UPDATE games SET kickoff = $1 WHERE id = $2",
-          [sdUtc.toISOString(), g.id]
+      if (diffMin > 1) {
+        console.log(
+          `[FIX ] id=${db.id} w${db.week} ${db.away_team} @ ${db.home_team}
+     DB:  ${dbKickoff}
+     API: ${apiKickoffUtc}
+     Δ = ${diffMin.toFixed(1)} min`
         );
-        updateCount++;
+        if (APPLY) {
+          await client.query(
+            "UPDATE games SET kickoff = $1 WHERE id = $2",
+            [apiKickoffUtc, db.id]
+          );
+        }
+        updates++;
       }
     }
-  }
 
-  if (APPLY) {
-    console.log(`Updated rows: ${updateCount}`);
-  } else {
-    console.log(`Dry run only. Rows that would be updated: ${updateCount}`);
+    console.log(
+      APPLY
+        ? `Updated rows: ${updates}`
+        : `Dry run only. Rows that would be updated: ${updates}`
+    );
+  } catch (err) {
+    console.error("FATAL:", err.message || err);
+    process.exitCode = 1;
+  } finally {
+    await client.end();
   }
-
-  await client.end();
 }
 
-main().catch((err) => {
-  console.error("FATAL:", err);
+main().catch((e) => {
+  console.error("Unhandled:", e);
   process.exit(1);
 });
