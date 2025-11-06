@@ -1,13 +1,35 @@
 // scripts/fetchOdds.js
 /* eslint-disable no-console */
+
+/**
+ * Fetch odds from The Odds API and populate:
+ *  - line_favorite, line_spread, line_over_under, line_source, line_updated_at
+ *  - favorite, spread (for current/future games) so frontend (PicksForm) can display odds
+ *
+ * Usage examples:
+ *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js
+ *     - updates current week only
+ *
+ *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --week 10 --minWeek 10
+ *     - force only week 10+ (good for late-season)
+ *
+ *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --all --maxWeeks 4 --minWeek 10
+ *     - current week + next few weeks
+ *
+ *   ALLOW_PAST=1 NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --week 10
+ *     - allow updates even if kickoff <= now (use with care)
+ */
+
 const { Client } = require("pg");
 
 /** ---------- Config & CLI ---------- **/
+
 const {
   RW_DB,
   ODDS_API_KEY,
   MIN_WEEK: MIN_WEEK_ENV,
   BOOKMAKERS: BOOKMAKERS_ENV,
+  ALLOW_PAST: ALLOW_PAST_ENV,
 } = process.env;
 
 if (!RW_DB) {
@@ -19,9 +41,7 @@ if (!ODDS_API_KEY) {
   process.exit(2);
 }
 
-// priority list of sportsbooks to use; first one present on the event wins
-// e.g. "caesars,draftkings,fanduel,betmgm"
-// If Caesars isn’t returned by the API, we’ll fall back to DK/FD/MGM etc.
+// sportsbook priority: first one present wins for that event
 const BOOKMAKERS = (BOOKMAKERS_ENV || "caesars,draftkings,fanduel,betmgm")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -34,23 +54,22 @@ const getVal = (flag) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 
-// Flags
 const ONLY_WEEK = getVal("--week") ? Number(getVal("--week")) : undefined;
 const DO_ALL = ARG("--all");
 const MAX_WEEKS = Number(getVal("--maxWeeks") || 3);
-const ALLOW_PAST = ARG("--allow-past");
-// hard guard you wanted
+const ALLOW_PAST = ARG("--allow-past") || ALLOW_PAST_ENV === "1";
 const MIN_WEEK = Number(getVal("--minWeek") || MIN_WEEK_ENV || 0);
 
-/** ---------- Helpers (robust name matching) ---------- **/
-// Keep letters *and digits* so "49ers" survives; lower-case; strip others.
+/** ---------- Helpers (name matching) ---------- **/
+
+// Keep letters+digits so "49ers" survives
 const slug = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 
-// Map common shorthand/variants to a canonical slug
+// Normalize many variants to consistent team slugs
 function canonicalSlug(raw) {
   let x = slug(raw);
 
-  // Normalize common city shorthands/abbrevs
+  // City/abbr normalizations
   x = x.replace(/^la(?=(rams|chargers)$)/, "losangeles");
   x = x.replace(/^ny(?=(jets|giants)$)/, "newyork");
   x = x.replace(/^kc(?=chiefs$)/, "kansascity");
@@ -64,7 +83,6 @@ function canonicalSlug(raw) {
   x = x.replace(/^was(?=(footballteam|commanders)$)/, "washingtoncommanders");
   x = x.replace(/^washington(?=footballteam$)/, "washingtoncommanders");
 
-  // Nickname-only failsafe
   const nicknameToCity = {
     cardinals: "arizonacardinals",
     falcons: "atlantafalcons",
@@ -101,6 +119,7 @@ function canonicalSlug(raw) {
     titans: "tennesseetitans",
     commanders: "washingtoncommanders",
   };
+
   if (nicknameToCity[x]) return nicknameToCity[x];
 
   return x;
@@ -112,13 +131,13 @@ const matchKey = (home, away) =>
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** ---------- The Odds API snapshot (multi-book) ---------- **/
+
 async function fetchAllOddsSnapshotWithFallback() {
-  // Pull *all* books then choose the first preferred one that's present
-  const base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds";
-  const url =
-    `${base}?regions=us,us2&markets=spreads,totals&oddsFormat=american&dateFormat=iso&apiKey=${encodeURIComponent(
-      ODDS_API_KEY
-    )}`;
+  const base =
+    "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds";
+  const url = `${base}?regions=us,us2&markets=spreads,totals&oddsFormat=american&dateFormat=iso&apiKey=${encodeURIComponent(
+    ODDS_API_KEY
+  )}`;
 
   const res = await fetch(url);
   if (!res.ok) {
@@ -127,9 +146,8 @@ async function fetchAllOddsSnapshotWithFallback() {
   }
 
   const events = await res.json();
-  console.log(
-    `Loaded ${Array.isArray(events) ? events.length : 0} events from The Odds API.`
-  );
+  const count = Array.isArray(events) ? events.length : 0;
+  console.log(`Loaded ${count} events from The Odds API.`);
   console.log(`Bookmaker priority: ${BOOKMAKERS.join(" → ")}`);
 
   const out = new Map();
@@ -142,7 +160,7 @@ async function fetchAllOddsSnapshotWithFallback() {
     const books = ev.bookmakers || [];
     if (!books.length) continue;
 
-    // choose the first book in our priority list that exists on this event
+    // choose first preferred book that exists
     const chosen =
       BOOKMAKERS.map((pref) =>
         books.find((b) => {
@@ -152,10 +170,7 @@ async function fetchAllOddsSnapshotWithFallback() {
         })
       ).find(Boolean) || null;
 
-    if (!chosen) {
-      // no preferred book for this event; skip
-      continue;
-    }
+    if (!chosen) continue;
 
     const provider = chosen.name || chosen.key || "Unknown";
     const spreads = (chosen.markets || []).find((m) => m.key === "spreads");
@@ -165,31 +180,40 @@ async function fetchAllOddsSnapshotWithFallback() {
     let spread = null;
     let overUnder = null;
 
-    // spreads: two outcomes w/ team names and handicap in "point"
+    // spreads: two outcomes with team + handicap
     if (spreads?.outcomes?.length >= 2) {
       const [o1, o2] = spreads.outcomes;
       const fav =
-        [o1, o2].find((o) => typeof o.point === "number" && o.point < 0) || null;
+        [o1, o2].find(
+          (o) => typeof o.point === "number" && Number(o.point) < 0
+        ) || null;
       if (fav) {
         favoriteName = fav.name || null;
-        spread = Math.abs(Number(fav.point)); // store positive magnitude
+        spread = Math.abs(Number(fav.point)); // store positive
       } else if (
-        [o1, o2].every((o) => typeof o.point === "number" && Number(o.point) === 0)
+        [o1, o2].every(
+          (o) => typeof o.point === "number" && Number(o.point) === 0
+        )
       ) {
-        // Pick/Even
-        spread = 0;
+        spread = 0; // pick'em
       }
     }
 
-    // totals: Over/Under share same "point"; prefer "Over"
+    // totals: Over/Under share same "point"
     if (totals?.outcomes?.length) {
-      const over = totals.outcomes.find((o) => /^over$/i.test(o.name || ""));
-      const under = totals.outcomes.find((o) => /^under$/i.test(o.name || ""));
+      const over = totals.outcomes.find((o) =>
+        /^over$/i.test(o.name || "")
+      );
+      const under = totals.outcomes.find((o) =>
+        /^under$/i.test(o.name || "")
+      );
       const pick = over || under || totals.outcomes[0];
-      if (pick && typeof pick.point === "number") overUnder = Number(pick.point);
+      if (pick && typeof pick.point === "number") {
+        overUnder = Number(pick.point);
+      }
     }
 
-    // optional: mark favorite side (home/away), though DB stores name/spread
+    // which side is favorite?
     let favoriteSide = null;
     if (favoriteName) {
       const fav = canonicalSlug(favoriteName);
@@ -219,6 +243,7 @@ async function fetchAllOddsSnapshotWithFallback() {
 }
 
 /** ---------- DB helpers ---------- **/
+
 async function ensureOddsColumns(client) {
   await client.query(`
     ALTER TABLE games
@@ -226,13 +251,18 @@ async function ensureOddsColumns(client) {
       ADD COLUMN IF NOT EXISTS line_spread      numeric,
       ADD COLUMN IF NOT EXISTS line_over_under  numeric,
       ADD COLUMN IF NOT EXISTS line_source      text,
-      ADD COLUMN IF NOT EXISTS line_updated_at  timestamptz;
+      ADD COLUMN IF NOT EXISTS line_updated_at  timestamptz,
+      ADD COLUMN IF NOT EXISTS favorite         text,
+      ADD COLUMN IF NOT EXISTS spread           numeric;
   `);
 }
 
 async function getCurrentWeek(client) {
   const { rows } = await client.query(`
-    SELECT COALESCE(MAX(week) FILTER (WHERE kickoff <= now()), MIN(week)) AS current_week
+    SELECT COALESCE(
+      MAX(week) FILTER (WHERE kickoff <= now()),
+      MIN(week)
+    ) AS current_week
     FROM games;
   `);
   return Number(rows[0].current_week);
@@ -249,16 +279,20 @@ async function weeksCurrentAndFuture(client, currentWeek) {
 async function dbGamesForWeek(client, week) {
   const { rows } = await client.query(
     `SELECT id, week, home_team, away_team, kickoff
-     FROM games
-     WHERE week = $1
-     ORDER BY kickoff, id`,
+       FROM games
+      WHERE week = $1
+      ORDER BY kickoff, id`,
     [week]
   );
   return rows;
 }
 
+/**
+ * Apply odds to a single game.
+ * - Always updates line_* fields (subject to guards).
+ * - Also mirrors into favorite/spread so frontend can read them.
+ */
 async function updateOdds(client, gameId, odds, currentWeek) {
-  // Protect past weeks + games already started (unless --allow-past)
   const guardWeek = ALLOW_PAST ? "" : "AND week >= $6";
   const guardKick = ALLOW_PAST ? "" : "AND kickoff > now()";
 
@@ -273,58 +307,70 @@ async function updateOdds(client, gameId, odds, currentWeek) {
            line_spread     = $2,
            line_over_under = $3,
            line_source     = $4,
-           line_updated_at = now()
+           line_updated_at = now(),
+           favorite        = COALESCE($1, favorite),
+           spread          = COALESCE($2, spread)
      WHERE id = $5
        ${guardWeek}
        ${guardKick}
   `;
+
   const params = ALLOW_PAST
     ? [favorite, spread, ou, src, gameId]
     : [favorite, spread, ou, src, gameId, currentWeek];
+
   const res = await client.query(sql, params);
   return res.rowCount;
 }
 
 /** ---------- Runner ---------- **/
+
 async function main() {
   const client = new Client({
     connectionString: RW_DB,
-    ssl: { rejectUnauthorized: false }, // Railway chain quirk
+    ssl: { rejectUnauthorized: false }, // Railway
   });
+
   await client.connect();
   await ensureOddsColumns(client);
 
   const currentWeek = await getCurrentWeek(client);
 
-  // Decide target weeks
+  // decide which weeks to target
   let targetWeeks = [];
   if (ONLY_WEEK) {
     targetWeeks = [ONLY_WEEK];
   } else if (DO_ALL) {
-    const allW = await weeksCurrentAndFuture(client, currentWeek);
-    targetWeeks = allW.slice(0, Math.max(1, MAX_WEEKS));
+    const all = await weeksCurrentAndFuture(client, currentWeek);
+    targetWeeks = all.slice(0, Math.max(1, MAX_WEEKS));
   } else {
     targetWeeks = [currentWeek];
   }
 
-  // Enforce the "don’t touch older weeks" guard at the script level too
+  // enforce minWeek guard
   targetWeeks = targetWeeks.filter((w) => w >= MIN_WEEK);
+
   console.log(
-    `\nTarget weeks: ${targetWeeks.join(", ")}  (current=${currentWeek}, minWeek=${MIN_WEEK})`
+    `\nTarget weeks: ${targetWeeks.join(
+      ", "
+    )}  (current=${currentWeek}, minWeek=${MIN_WEEK}, allowPast=${
+      ALLOW_PAST ? "yes" : "no"
+    })`
   );
 
-  let totalUpdated = 0;
-  let totalMissing = 0;
-  let totalUnmatched = 0;
-
-  // One snapshot (all books), choose per-game by priority list
+  // fetch snapshot once
   let snapshot;
   try {
     snapshot = await fetchAllOddsSnapshotWithFallback();
   } catch (e) {
     console.error(`✖ Odds fetch failed: ${e.message}`);
-    throw e;
+    await client.end();
+    process.exit(2);
   }
+
+  let totalUpdated = 0;
+  let totalMissing = 0;
+  let totalUnmatched = 0;
 
   for (const w of targetWeeks) {
     console.log(`\n===== ODDS: Week ${w} =====`);
@@ -332,18 +378,29 @@ async function main() {
     console.log(`→ DB games: ${games.length}`);
 
     const rows = [];
+
     for (const g of games) {
       const hit = snapshot.get(matchKey(g.home_team, g.away_team));
 
       if (!hit) {
         totalUnmatched++;
-        rows.push([g.id, `${g.home_team} vs ${g.away_team}`, "UNMATCHED", ""]);
+        rows.push({
+          id: g.id,
+          match: `${g.home_team} vs ${g.away_team}`,
+          line: "UNMATCHED",
+          source: "",
+        });
         continue;
       }
 
       if (hit.spread == null && hit.overUnder == null) {
         totalMissing++;
-        rows.push([g.id, `${g.home_team} vs ${g.away_team}`, "MISSING", hit.provider || ""]);
+        rows.push({
+          id: g.id,
+          match: `${g.home_team} vs ${g.away_team}`,
+          line: "MISSING",
+          source: hit.provider || "",
+        });
         continue;
       }
 
@@ -351,35 +408,39 @@ async function main() {
       if (changed) {
         totalUpdated += changed;
         const line =
-          (hit.favoriteName ? `${hit.favoriteName} -${hit.spread ?? 0}` : "Pick/Even") +
+          (hit.favoriteName
+            ? `${hit.favoriteName} -${hit.spread ?? 0}`
+            : "Pick/Even") +
           (hit.overUnder != null ? ` (O/U ${hit.overUnder})` : "");
-        rows.push([g.id, `${g.home_team} vs ${g.away_team}`, line, hit.provider || ""]);
+        rows.push({
+          id: g.id,
+          match: `${g.home_team} vs ${g.away_team}`,
+          line,
+          source: hit.provider || "",
+        });
       } else {
-        rows.push([
-          g.id,
-          `${g.home_team} vs ${g.away_team}`,
-          "SKIPPED (guard: past or started)",
-          hit.provider || "",
-        ]);
+        rows.push({
+          id: g.id,
+          match: `${g.home_team} vs ${g.away_team}`,
+          line: "SKIPPED (guard: past/started or minWeek)",
+          source: hit.provider || "",
+        });
       }
+
       await sleep(15);
     }
 
     if (rows.length) {
-      console.table(rows.map(([id, match, line, source]) => ({ id, match, line, source })));
+      console.table(rows);
     }
   }
 
   console.log("\n=== Odds Summary ===");
-  console.log(`Updated rows:   ${totalUpdated}`);
-  console.log(`Missing odds:   ${totalMissing}`);
-  console.log(`Unmatched teams:${totalUnmatched}`);
+  console.log(`Updated rows:    ${totalUpdated}`);
+  console.log(`Missing odds:    ${totalMissing}`);
+  console.log(`Unmatched teams: ${totalUnmatched}`);
 
   await client.end();
-
-  // Keep CI green even if some events didn't match
-  // (comment next line back in if you *want* failures)
-  // if (totalUnmatched > 0) process.exitCode = 1;
 }
 
 main().catch((e) => {
