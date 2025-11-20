@@ -1,28 +1,7 @@
 // scripts/fetchOdds.js
 /* eslint-disable no-console */
-
-/**
- * Fetch odds from The Odds API and populate:
- *  - line_favorite, line_spread, line_over_under, line_source, line_updated_at
- *  - favorite, spread (for current/future games) so frontend (PicksForm) can display odds
- *
- * Usage examples:
- *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js
- *     - updates current week only
- *
- *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --week 10 --minWeek 10
- *     - force only week 10+ (good for late-season)
- *
- *   NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --all --maxWeeks 4 --minWeek 10
- *     - current week + next few weeks
- *
- *   ALLOW_PAST=1 NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/fetchOdds.js --week 10
- *     - allow updates even if kickoff <= now (use with care)
- */
-
 const { Client } = require("pg");
-
-/** ---------- Config & CLI ---------- **/
+const fetch = global.fetch || ((...args) => import("node-fetch").then(m => m.default(...args)));
 
 const {
   RW_DB,
@@ -32,44 +11,28 @@ const {
   ALLOW_PAST: ALLOW_PAST_ENV,
 } = process.env;
 
-if (!RW_DB) {
-  console.error("Missing env: RW_DB");
-  process.exit(2);
-}
-if (!ODDS_API_KEY) {
-  console.error("Missing env: ODDS_API_KEY (The Odds API key)");
-  process.exit(2);
-}
+if (!RW_DB) { console.error("Missing env: RW_DB"); process.exit(2); }
+if (!ODDS_API_KEY) { console.error("Missing env: ODDS_API_KEY"); process.exit(2); }
 
-// sportsbook priority: first one present wins for that event
 const BOOKMAKERS = (BOOKMAKERS_ENV || "caesars,draftkings,fanduel,betmgm")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const args = process.argv.slice(2);
-const ARG = (flag) => args.includes(flag);
-const getVal = (flag) => {
-  const i = args.indexOf(flag);
-  return i >= 0 ? args[i + 1] : undefined;
-};
+const ARG    = (flag) => args.includes(flag);
+const getVal = (flag, dflt) => { const i = args.indexOf(flag); return i >= 0 ? args[i+1] : dflt; };
 
-const ONLY_WEEK = getVal("--week") ? Number(getVal("--week")) : undefined;
-const DO_ALL = ARG("--all");
-const MAX_WEEKS = Number(getVal("--maxWeeks") || 3);
+const ONLY_WEEK  = getVal("--week") ? Number(getVal("--week")) : undefined;
+const DO_ALL     = ARG("--all");
+const MAX_WEEKS  = Number(getVal("--maxWeeks", "3"));
+const MIN_WEEK   = Number(getVal("--minWeek", MIN_WEEK_ENV || "0"));
 const ALLOW_PAST = ARG("--allow-past") || ALLOW_PAST_ENV === "1";
-const MIN_WEEK = Number(getVal("--minWeek") || MIN_WEEK_ENV || 0);
 
-/** ---------- Helpers (name matching) ---------- **/
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Keep letters+digits so "49ers" survives
+/* ---------- robust name matching ---------- */
 const slug = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-
-// Normalize many variants to consistent team slugs
 function canonicalSlug(raw) {
   let x = slug(raw);
-
-  // City/abbr normalizations
   x = x.replace(/^la(?=(rams|chargers)$)/, "losangeles");
   x = x.replace(/^ny(?=(jets|giants)$)/, "newyork");
   x = x.replace(/^kc(?=chiefs$)/, "kansascity");
@@ -82,168 +45,26 @@ function canonicalSlug(raw) {
   x = x.replace(/^jax(?=jaguars$)/, "jacksonville");
   x = x.replace(/^was(?=(footballteam|commanders)$)/, "washingtoncommanders");
   x = x.replace(/^washington(?=footballteam$)/, "washingtoncommanders");
-
   const nicknameToCity = {
-    cardinals: "arizonacardinals",
-    falcons: "atlantafalcons",
-    ravens: "baltimoreravens",
-    bills: "buffalobills",
-    panthers: "carolinapanthers",
-    bears: "chicagobears",
-    bengals: "cincinnatibengals",
-    browns: "clevelandbrowns",
-    cowboys: "dallascowboys",
-    broncos: "denverbroncos",
-    lions: "detroitlions",
-    packers: "greenbaypackers",
-    texans: "houstontexans",
-    colts: "indianapoliscolts",
-    jaguars: "jacksonvillejaguars",
-    chiefs: "kansascitychiefs",
-    raiders: "lasvegasraiders",
-    chargers: "losangeleschargers",
-    rams: "losangelesrams",
-    dolphins: "miamidolphins",
-    vikings: "minnesotavikings",
-    patriots: "newenglandpatriots",
-    saints: "neworleanssaints",
-    giants: "newyorkgiants",
-    jets: "newyorkjets",
-    eagles: "philadelphiaeagles",
-    steelers: "pittsburghsteelers",
-    niners: "sanfrancisco49ers",
-    "49ers": "sanfrancisco49ers",
-    seahawks: "seattleseahawks",
-    buccaneers: "tampabaybuccaneers",
-    bucs: "tampabaybuccaneers",
-    titans: "tennesseetitans",
-    commanders: "washingtoncommanders",
+    cardinals:"arizonacardinals", falcons:"atlantafalcons", ravens:"baltimoreravens",
+    bills:"buffalobills", panthers:"carolinapanthers", bears:"chicagobears",
+    bengals:"cincinnatibengals", browns:"clevelandbrowns", cowboys:"dallascowboys",
+    broncos:"denverbroncos", lions:"detroitlions", packers:"greenbaypackers",
+    texans:"houstontexans", colts:"indianapoliscolts", jaguars:"jacksonvillejaguars",
+    chiefs:"kansascitychiefs", raiders:"lasvegasraiders", chargers:"losangeleschargers",
+    rams:"losangelesrams", dolphins:"miamidolphins", vikings:"minnesotavikings",
+    patriots:"newenglandpatriots", saints:"neworleanssaints", giants:"newyorkgiants",
+    jets:"newyorkjets", eagles:"philadelphiaeagles", steelers:"pittsburghsteelers",
+    niners:"sanfrancisco49ers", "49ers":"sanfrancisco49ers", seahawks:"seattleseahawks",
+    buccaneers:"tampabaybuccaneers", bucs:"tampabaybuccaneers", titans:"tennesseetitans",
+    commanders:"washingtoncommanders",
   };
-
   if (nicknameToCity[x]) return nicknameToCity[x];
-
   return x;
 }
+const matchKey = (home, away) => `${canonicalSlug(home)}__${canonicalSlug(away)}`;
 
-const matchKey = (home, away) =>
-  `${canonicalSlug(home)}__${canonicalSlug(away)}`;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** ---------- The Odds API snapshot (multi-book) ---------- **/
-
-async function fetchAllOddsSnapshotWithFallback() {
-  const base =
-    "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds";
-  const url = `${base}?regions=us,us2&markets=spreads,totals&oddsFormat=american&dateFormat=iso&apiKey=${encodeURIComponent(
-    ODDS_API_KEY
-  )}`;
-
-  const res = await fetch(url);
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`The Odds API failed ${res.status} ${txt}`.trim());
-  }
-
-  const events = await res.json();
-  const count = Array.isArray(events) ? events.length : 0;
-  console.log(`Loaded ${count} events from The Odds API.`);
-  console.log(`Bookmaker priority: ${BOOKMAKERS.join(" → ")}`);
-
-  const out = new Map();
-
-  for (const ev of events || []) {
-    const homeName = ev.home_team;
-    const awayName = ev.away_team;
-    if (!homeName || !awayName) continue;
-
-    const books = ev.bookmakers || [];
-    if (!books.length) continue;
-
-    // choose first preferred book that exists
-    const chosen =
-      BOOKMAKERS.map((pref) =>
-        books.find((b) => {
-          const k = (b.key || "").toLowerCase();
-          const n = (b.name || "").toLowerCase();
-          return k === pref || n.includes(pref);
-        })
-      ).find(Boolean) || null;
-
-    if (!chosen) continue;
-
-    const provider = chosen.name || chosen.key || "Unknown";
-    const spreads = (chosen.markets || []).find((m) => m.key === "spreads");
-    const totals = (chosen.markets || []).find((m) => m.key === "totals");
-
-    let favoriteName = null;
-    let spread = null;
-    let overUnder = null;
-
-    // spreads: two outcomes with team + handicap
-    if (spreads?.outcomes?.length >= 2) {
-      const [o1, o2] = spreads.outcomes;
-      const fav =
-        [o1, o2].find(
-          (o) => typeof o.point === "number" && Number(o.point) < 0
-        ) || null;
-      if (fav) {
-        favoriteName = fav.name || null;
-        spread = Math.abs(Number(fav.point)); // store positive
-      } else if (
-        [o1, o2].every(
-          (o) => typeof o.point === "number" && Number(o.point) === 0
-        )
-      ) {
-        spread = 0; // pick'em
-      }
-    }
-
-    // totals: Over/Under share same "point"
-    if (totals?.outcomes?.length) {
-      const over = totals.outcomes.find((o) =>
-        /^over$/i.test(o.name || "")
-      );
-      const under = totals.outcomes.find((o) =>
-        /^under$/i.test(o.name || "")
-      );
-      const pick = over || under || totals.outcomes[0];
-      if (pick && typeof pick.point === "number") {
-        overUnder = Number(pick.point);
-      }
-    }
-
-    // which side is favorite?
-    let favoriteSide = null;
-    if (favoriteName) {
-      const fav = canonicalSlug(favoriteName);
-      const h = canonicalSlug(homeName);
-      const a = canonicalSlug(awayName);
-      if (fav === h) favoriteSide = "home";
-      else if (fav === a) favoriteSide = "away";
-    }
-
-    const payload = {
-      provider,
-      espnHome: { name: homeName, abbr: null },
-      espnAway: { name: awayName, abbr: null },
-      overUnder: overUnder != null ? overUnder : null,
-      favoriteSide: favoriteSide || null,
-      favoriteName: favoriteName || null,
-      spread: typeof spread === "number" ? spread : null,
-    };
-
-    const k1 = matchKey(homeName, awayName);
-    const k2 = matchKey(awayName, homeName);
-    out.set(k1, payload);
-    out.set(k2, payload);
-  }
-
-  return out;
-}
-
-/** ---------- DB helpers ---------- **/
-
+/* ---------- DB helpers ---------- */
 async function ensureOddsColumns(client) {
   await client.query(`
     ALTER TABLE games
@@ -256,50 +77,83 @@ async function ensureOddsColumns(client) {
       ADD COLUMN IF NOT EXISTS spread           numeric;
   `);
 }
-
 async function getCurrentWeek(client) {
   const { rows } = await client.query(`
-    SELECT COALESCE(
-      MAX(week) FILTER (WHERE kickoff <= now()),
-      MIN(week)
-    ) AS current_week
+    SELECT COALESCE(MAX(week) FILTER (WHERE kickoff <= now()), MIN(week)) AS current_week
     FROM games;
   `);
-  return Number(rows[0].current_week);
+  return Number(rows[0].current_week || 1);
 }
-
 async function weeksCurrentAndFuture(client, currentWeek) {
   const { rows } = await client.query(
-    `SELECT DISTINCT week FROM games WHERE week >= $1 ORDER BY week`,
-    [currentWeek]
+    `SELECT DISTINCT week FROM games WHERE week >= $1 ORDER BY week`, [currentWeek]
   );
-  return rows.map((r) => Number(r.week));
+  return rows.map(r => Number(r.week));
 }
-
 async function dbGamesForWeek(client, week) {
   const { rows } = await client.query(
     `SELECT id, week, home_team, away_team, kickoff
        FROM games
       WHERE week = $1
-      ORDER BY kickoff, id`,
-    [week]
+      ORDER BY kickoff, id`, [week]
   );
   return rows;
 }
 
-/**
- * Apply odds to a single game.
- * - Always updates line_* fields (subject to guards).
- * - Also mirrors into favorite/spread so frontend can read them.
- */
+/* ---------- Odds API per-week window ---------- */
+async function fetchOddsForWindow(fromIso, toIso) {
+  const base = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds";
+  const url = `${base}?regions=us,us2&markets=spreads,totals&oddsFormat=american&dateFormat=iso` +
+              `&commenceTimeFrom=${encodeURIComponent(fromIso)}` +
+              `&commenceTimeTo=${encodeURIComponent(toIso)}` +
+              `&apiKey=${encodeURIComponent(ODDS_API_KEY)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const txt = await res.text().catch(()=> "");
+    throw new Error(`The Odds API ${res.status} ${txt}`);
+  }
+  return res.json();
+}
+function chooseBookmaker(books) {
+  if (!Array.isArray(books) || !books.length) return null;
+  return BOOKMAKERS.map(pref =>
+    books.find(b => {
+      const k = (b.key||"").toLowerCase();
+      const n = (b.name||"").toLowerCase();
+      return k === pref || n.includes(pref);
+    })
+  ).find(Boolean) || null;
+}
+function extractLine(chosen) {
+  if (!chosen) return { favoriteName:null, spread:null, overUnder:null, provider:null };
+  const provider = chosen.name || chosen.key || "Unknown";
+  const spreads = (chosen.markets||[]).find(m => m.key === "spreads");
+  const totals  = (chosen.markets||[]).find(m => m.key === "totals");
+  let favoriteName = null, spread = null, overUnder = null;
+  if (spreads?.outcomes?.length >= 2) {
+    const [o1, o2] = spreads.outcomes;
+    const fav = [o1,o2].find(o => typeof o.point === "number" && o.point < 0) || null;
+    if (fav) { favoriteName = fav.name || null; spread = Math.abs(Number(fav.point)); }
+    else if ([o1,o2].every(o => typeof o.point === "number" && Number(o.point) === 0)) { spread = 0; }
+  }
+  if (totals?.outcomes?.length) {
+    const over  = totals.outcomes.find(o => /^over$/i.test(o.name || ""));
+    const under = totals.outcomes.find(o => /^under$/i.test(o.name || ""));
+    const pick = over || under || totals.outcomes[0];
+    if (pick && typeof pick.point === "number") overUnder = Number(pick.point);
+  }
+  return { favoriteName, spread, overUnder, provider };
+}
+
+/* ---------- apply to DB ---------- */
 async function updateOdds(client, gameId, odds, currentWeek) {
   const guardWeek = ALLOW_PAST ? "" : "AND week >= $6";
   const guardKick = ALLOW_PAST ? "" : "AND kickoff > now()";
 
   const favorite = odds.favoriteName || null;
-  const spread = odds.spread != null ? Number(odds.spread) : null;
-  const ou = odds.overUnder != null ? Number(odds.overUnder) : null;
-  const src = odds.provider || "Unknown";
+  const spread   = odds.spread != null ? Number(odds.spread) : null;
+  const ou       = odds.overUnder != null ? Number(odds.overUnder) : null;
+  const src      = odds.provider || "Unknown";
 
   const sql = `
     UPDATE games
@@ -314,136 +168,91 @@ async function updateOdds(client, gameId, odds, currentWeek) {
        ${guardWeek}
        ${guardKick}
   `;
-
-  const params = ALLOW_PAST
-    ? [favorite, spread, ou, src, gameId]
-    : [favorite, spread, ou, src, gameId, currentWeek];
-
+  const params = ALLOW_PAST ? [favorite, spread, ou, src, gameId]
+                            : [favorite, spread, ou, src, gameId, currentWeek];
   const res = await client.query(sql, params);
   return res.rowCount;
 }
 
-/** ---------- Runner ---------- **/
-
+/* ---------- main ---------- */
 async function main() {
-  const client = new Client({
-    connectionString: RW_DB,
-    ssl: { rejectUnauthorized: false }, // Railway
-  });
-
+  const client = new Client({ connectionString: RW_DB, ssl: { rejectUnauthorized: false }});
   await client.connect();
   await ensureOddsColumns(client);
 
   const currentWeek = await getCurrentWeek(client);
 
-  // decide which weeks to target
   let targetWeeks = [];
-  if (ONLY_WEEK) {
-    targetWeeks = [ONLY_WEEK];
-  } else if (DO_ALL) {
-    const all = await weeksCurrentAndFuture(client, currentWeek);
-    targetWeeks = all.slice(0, Math.max(1, MAX_WEEKS));
-  } else {
-    targetWeeks = [currentWeek];
-  }
+  if (ONLY_WEEK) targetWeeks = [ONLY_WEEK];
+  else if (DO_ALL) targetWeeks = (await weeksCurrentAndFuture(client, currentWeek)).slice(0, Math.max(1, MAX_WEEKS));
+  else targetWeeks = [currentWeek];
 
-  // enforce minWeek guard
-  targetWeeks = targetWeeks.filter((w) => w >= MIN_WEEK);
+  targetWeeks = targetWeeks.filter(w => w >= MIN_WEEK);
+  console.log(`\nTarget weeks: ${targetWeeks.join(", ")}  (current=${currentWeek}, minWeek=${MIN_WEEK}, allowPast=${ALLOW_PAST ? "yes":"no"})`);
 
-  console.log(
-    `\nTarget weeks: ${targetWeeks.join(
-      ", "
-    )}  (current=${currentWeek}, minWeek=${MIN_WEEK}, allowPast=${
-      ALLOW_PAST ? "yes" : "no"
-    })`
-  );
-
-  // fetch snapshot once
-  let snapshot;
-  try {
-    snapshot = await fetchAllOddsSnapshotWithFallback();
-  } catch (e) {
-    console.error(`✖ Odds fetch failed: ${e.message}`);
-    await client.end();
-    process.exit(2);
-  }
-
-  let totalUpdated = 0;
-  let totalMissing = 0;
-  let totalUnmatched = 0;
+  let totalUpdated = 0, totalMissing = 0, totalUnmatched = 0;
 
   for (const w of targetWeeks) {
-    console.log(`\n===== ODDS: Week ${w} =====`);
     const games = await dbGamesForWeek(client, w);
+    console.log(`\n===== ODDS: Week ${w} =====`);
     console.log(`→ DB games: ${games.length}`);
+    if (!games.length) continue;
+
+    const times = games.map(g => new Date(g.kickoff).getTime()).filter(Number.isFinite);
+    const minT = Math.min(...times), maxT = Math.max(...times);
+    const fromIso = new Date(minT - 36*3600_000).toISOString();
+    const toIso   = new Date(maxT + 36*3600_000).toISOString();
+
+    let events = [];
+    try {
+      events = await fetchOddsForWindow(fromIso, toIso);
+      console.log(`Fetched ${events.length || 0} events for window ${fromIso} → ${toIso}`);
+    } catch (e) {
+      console.error(`✖ Odds fetch failed for week ${w}: ${e.message}`);
+      continue;
+    }
+
+    const byKey = new Map();
+    for (const ev of events || []) {
+      const home = ev.home_team, away = ev.away_team;
+      if (!home || !away) continue;
+      const chosen = chooseBookmaker(ev.bookmakers || []);
+      const payload = extractLine(chosen);
+      byKey.set(matchKey(home, away), payload);
+      byKey.set(matchKey(away, home), payload);
+    }
 
     const rows = [];
-
     for (const g of games) {
-      const hit = snapshot.get(matchKey(g.home_team, g.away_team));
-
+      const hit = byKey.get(matchKey(g.home_team, g.away_team));
       if (!hit) {
-        totalUnmatched++;
-        rows.push({
-          id: g.id,
-          match: `${g.home_team} vs ${g.away_team}`,
-          line: "UNMATCHED",
-          source: "",
-        });
-        continue;
+        totalUnmatched++; rows.push([g.id, `${g.home_team} vs ${g.away_team}`, "UNMATCHED", ""]); continue;
       }
-
-      if (hit.spread == null && hit.overUnder == null) {
-        totalMissing++;
-        rows.push({
-          id: g.id,
-          match: `${g.home_team} vs ${g.away_team}`,
-          line: "MISSING",
-          source: hit.provider || "",
-        });
-        continue;
+      if (hit.spread == null && hit.overUnder == null && !hit.favoriteName) {
+        totalMissing++; rows.push([g.id, `${g.home_team} vs ${g.away_team}`, "MISSING", hit.provider || ""]); continue;
       }
 
       const changed = await updateOdds(client, g.id, hit, currentWeek);
       if (changed) {
         totalUpdated += changed;
-        const line =
-          (hit.favoriteName
-            ? `${hit.favoriteName} -${hit.spread ?? 0}`
-            : "Pick/Even") +
-          (hit.overUnder != null ? ` (O/U ${hit.overUnder})` : "");
-        rows.push({
-          id: g.id,
-          match: `${g.home_team} vs ${g.away_team}`,
-          line,
-          source: hit.provider || "",
-        });
+        const line = (hit.favoriteName ? `${hit.favoriteName} -${hit.spread ?? 0}` : "Pick/Even") +
+                     (hit.overUnder != null ? ` (O/U ${hit.overUnder})` : "");
+        rows.push([g.id, `${g.home_team} vs ${g.away_team}`, line, hit.provider || ""]);
       } else {
-        rows.push({
-          id: g.id,
-          match: `${g.home_team} vs ${g.away_team}`,
-          line: "SKIPPED (guard: past/started or minWeek)",
-          source: hit.provider || "",
-        });
+        rows.push([g.id, `${g.home_team} vs ${g.away_team}`, "SKIPPED (guard: past/started)", hit.provider || ""]);
       }
-
       await sleep(15);
     }
 
-    if (rows.length) {
-      console.table(rows);
-    }
+    if (rows.length) console.table(rows.map(([id, match, line, source]) => ({ id, match, line, source })));
   }
 
   console.log("\n=== Odds Summary ===");
-  console.log(`Updated rows:    ${totalUpdated}`);
-  console.log(`Missing odds:    ${totalMissing}`);
-  console.log(`Unmatched teams: ${totalUnmatched}`);
+  console.log(`Updated rows:   ${totalUpdated}`);
+  console.log(`Missing odds:   ${totalMissing}`);
+  console.log(`Unmatched:      ${totalUnmatched}`);
 
   await client.end();
 }
 
-main().catch((e) => {
-  console.error("Fatal:", e);
-  process.exit(2);
-});
+main().catch(e => { console.error("Fatal:", e); process.exit(2); });
